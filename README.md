@@ -215,15 +215,17 @@ timeout, `(work-queue producer worker)` resolves with the first three entries:
 
 Three BLPOPs went out: one per item, and the one in flight when `stop-feed!` was
 called. The stop sends no further pop, waits for that one (here it timed out, since the
-queue was empty; had it answered, the item would have been delivered to the channel for
-draining) and closes the channel, so the third take yields nil and nothing popped is
-lost. The channel has a FIXED buffer of 1024 items (the `:buffer-size` option): when
-it is full the next pop waits for the consumer, so a slow consumer leaves items in Redis
-instead of dropping them. `:timeout-s 0`, the default, pops without limit. Closing the
+queue was empty; had it answered, the item would have been handed to the channel) and
+closes the channel; what the channel holds stays takeable until exhausted, so the third
+take yields nil and nothing popped is lost. The channel has a FIXED buffer of 1024
+items (the `:buffer-size` option): when it is full the next pop waits for the consumer,
+so a slow consumer leaves items in Redis instead of dropping them; a full buffer never
+makes `stop-feed!` wait, since the item waiting for room stays takeable after the
+close: drain until nil. `:timeout-s 0`, the default, pops without limit. Closing the
 channel yourself also stops the feed but loses the item of the pop in flight: use
-`stop-feed!`. `end!` stops the feeds the same way before closing. An error (a WRONGTYPE
-reply, the connection gone) arrives on the channel as `{:error e}` before it closes.
-`brpop!` is the same from the tail of the list.
+`stop-feed!`. `end!` stops the feeds the same way and resolves once their channels are
+closed. An error (a WRONGTYPE reply, the connection gone) arrives on the channel as
+`{:error e}` before it closes. `brpop!` is the same from the tail of the list.
 
 ### Pub/sub across two connections
 
@@ -521,7 +523,7 @@ Client configuration (`connect!`; every key is a pool key too):
 
 | key                       | default                          | meaning                                                                     |
 |---------------------------|----------------------------------|-----------------------------------------------------------------------------|
-| `:url`                    | none                             | `redis://[[username][:password]@][host][:port][/db]`, `rediss://` for TLS; its parts override the keys below |
+| `:url`                    | none                             | `redis://[[username][:password]@]host[:port][/db]`, `rediss://` for TLS; its parts override the keys below and are checked like them (a host, a port in range, an integer database, a scheme consistent with `:tls`) |
 | `:host`                   | none; `:url` or `:host` is required | the server, a non-blank string                                           |
 | `:port`                   | 6379                             | 1 to 65535                                                                  |
 | `:tls`                    | `false`                          | `true` for TLS                                                              |
@@ -574,8 +576,9 @@ emulate RESP3 (a hash is a flat vector; use `helpers/pairs->map`); it sends one
 command at a time in the order given on one connection (node-redis pipelines them),
 so a blocking pop holds every command behind it: give it a connection of its own.
 `end!` waits for the commands in flight, a blocking pop included; `{:force? true}`
-cuts them. An integer reply above 2^53 arrives as a JavaScript number and loses
-precision; store such values as strings.
+cuts them, also when a graceful `end!` (or two) is still waiting. An integer reply
+above 2^53 arrives as a JavaScript number and loses precision; store such values as
+strings.
 
 ## Documentation
 
@@ -633,7 +636,7 @@ docs/
   `env-keys`, `env-booleans`, `url-pattern`, `command-options`, `command-function`,
   `error-types`; `(config->upstream config)`, `(pool-config->upstream config)`,
   `(command->upstream cmd)`, `(redacted config)`, `(unwrap-env-value v)`,
-  `(parse-integer s)`, `(env->config env)`, `(error-reply-code message)`,
+  `(parse-integer s)`, `(parse-url url)`, `(env->config env)`, `(error-reply-code message)`,
   `(error-type e)`, `(error-data e)`, `(warnings-of error-element? v)`, the error
   constructors `config-error`, `argument-error`, `network-error`, `api-error`, the
   validators `connect-config`, `pool-config`, `normalize-config`, `check-config!`,

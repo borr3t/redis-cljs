@@ -98,6 +98,24 @@
 ;; Construction
 ;; ---------------------------------------------------------------------------
 
+(defn- check-construction!
+  "Upstream builds the pool's clients at connect!, where a configuration
+   it refuses (a URL it cannot parse, a :tls key that contradicts the
+   scheme) would surface as a network-error carrying its message, URL
+   included. The same construction is run here once, at pool!, on a
+   throwaway client that never connects: what upstream throws becomes a
+   config-error naming :url with the URL redacted, before anything is
+   sent."
+  [cfg js-client-options]
+  (try
+    (b/destroy (b/make-client js-client-options))
+    (catch :default e
+      (if (util/passthrough-error? e)
+        (throw e)
+        (throw (util/config-error 'redis-cljs.pool/pool! :url
+                                  "a URL node-redis accepts with the other keys: redis://[[username][:password]@][host][:port][/db], rediss:// when :tls is true"
+                                  (:url (util/redacted cfg))))))))
+
 (defn pool!
   "Creates a pool and returns its handle at once, without connecting.
    `config` is a map of redis-cljs.util/pool-config-keys (every connect!
@@ -106,15 +124,17 @@
    defaults apply to absent pool keys: :minimum 1, :maximum 100,
    :acquire-timeout-ms 3000 (0 waits without limit), :cleanup-delay-ms
    3000. Throws a config-error synchronously for an unknown key, a wrong
-   value (:minimum above :maximum included) or a configuration without
-   :url or :host, its :received redacted. The clients are opened by
+   value (:minimum above :maximum included), a configuration without
+   :url or :host, or a :url upstream cannot use, its :received redacted. The clients are opened by
    connect! (the first :minimum) and on demand up to :maximum; idle
    clients above :minimum are closed after :cleanup-delay-ms. Each client
    is configured as a connect! client is (:reconnect false unless set)."
   [config]
   (let [cfg (-> config util/pool-config util/normalize-config util/check-pool-config!)
         [client-options pool-options] (util/pool-config->upstream cfg)
-        js-pool (b/make-pool (b/config->js client-options) (b/config->js pool-options))
+        js-client-options (b/config->js client-options)
+        _ (check-construction! cfg js-client-options)
+        js-pool (b/make-pool js-client-options (b/config->js pool-options))
         handle (->Pool js-pool (atom {:config cfg :handles {}}))]
     (b/on js-pool "error" (fn [e] (swap! (:state handle) assoc :last-error (->network-error :event e))))
     handle))

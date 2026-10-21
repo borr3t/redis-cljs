@@ -97,9 +97,12 @@ pub/sub messages (sliding buffer, 1024 by default, oldest dropped when full) and
 1024 by default: when it is full the next pop waits for the consumer, so nothing
 popped is dropped). Both buffer sizes are the =:buffer-size= option. A feed ends when
 a pop times out, when =stop-feed!= stops it (no further pop; the pop in flight is
-waited for and its item delivered; then the channel closes) or when the client ends
-(=end!= stops the feeds the same way, and a connection gone for good closes them);
-closing the channel yourself stops it too but loses the item of the pop in flight.
+waited for and its item handed to the channel; then the channel closes, and what it
+holds stays takeable until exhausted, a put still waiting for room included, so a
+full buffer never makes the stop wait) or when the client ends (=end!= stops the
+feeds the same way and resolves once their channels are closed; a connection gone
+for good closes them too); closing the channel yourself stops it too but loses the
+item of the pop in flight.
 
 ** The configuration translation
 
@@ -271,8 +274,10 @@ every time, and drops it when that client ends.
 Observed: with =maintNotifications= at its default, node-redis sends =CLIENT
 MAINT_NOTIFICATIONS ON moving-endpoint-type ...= in the handshake, and to choose the
 endpoint type it looks the host name up through DNS (an IP literal is not looked up).
-Against OSS Redis the command is answered with an error that node-redis ignores. The
-library defaults =:maint-notifications= to ="disabled"=: no DNS, no extra command.
+Against OSS Redis the command is answered with an error that node-redis ignores, and
+under RESP2 node-redis refuses the feature outright ("Graceful Maintenance is only
+supported with RESP3"). The library sets =maintNotifications "disabled"= on every
+client and exposes no key for it: no DNS, no extra command.
 
 ** =CLIENT SETINFO= is sent on every connection
 
@@ -366,24 +371,24 @@ server, the RESP2 encoding of an integer reply, changed from =(crlf ":" reply)= 
 output of the broken run (exit status 1):
 
 #+begin_example
-FAIL in (commands-round-trip-as-data) (redis_cljs/core_test.cljs:295:21)
+FAIL in (commands-round-trip-as-data) (redis_cljs/core_test.cljs:305:21)
 replies are what the server sent: strings, numbers, nil, vectors
 expected: (= 1 setnx)
   actual: (not (= 1 2))
 ...
-FAIL in (commands-round-trip-as-data) (redis_cljs/core_test.cljs:299:21)
+FAIL in (commands-round-trip-as-data) (redis_cljs/core_test.cljs:309:21)
 replies are what the server sent: strings, numbers, nil, vectors
 expected: (= 42 incr)
   actual: (not (= 42 43))
 ...
-Ran 84 tests containing 989 assertions.
+Ran 89 tests containing 1124 assertions.
 38 failures, 0 errors.
 #+end_example
 
 And of the run after the revert (exit status 0):
 
 #+begin_example
-Ran 84 tests containing 989 assertions.
+Ran 89 tests containing 1124 assertions.
 0 failures, 0 errors.
 #+end_example
 
@@ -432,7 +437,7 @@ non-function.
 =(wrap-client js-client pooled?)= returns a client handle around a node-redis client
 object with the =error=, =end= and =terminated= listeners attached. Used by =connect!=
 and the pool, once per upstream client; callers never need it. Throws an
-argument-error for a non-object or a non-boolean.
+argument-error for anything that is not an event emitter, or a non-boolean.
 
 **** redis-cljs.core/from-env
 =(from-env)= returns the configuration map read from =REDIS_URL=, =REDIS_HOST=,
@@ -481,9 +486,11 @@ channel, options and errors.
 **** redis-cljs.core/stop-feed!
 =(stop-feed! client ch)= stops the feed of =ch= (a channel =brpop!= or =blpop!=
 returned for =client=): no further pop is sent, the pop in flight is waited for and
-its item delivered, then the channel is closed; resolves with nil once the channel is
-closed (nil at once for a feed already finished). Rejects with an argument-error for
-a non-client or a channel that is not a feed of this client.
+its item handed to the channel, then the channel is closed; resolves with nil once
+the channel is closed (nil at once for a feed already finished or any closed
+channel). What the channel holds stays takeable: drain until nil. Rejects with an
+argument-error for a non-client or a channel that is neither a feed of this client
+nor closed (nil, a number, a foreign open channel).
 
 **** redis-cljs.core/feeds
 =(feeds client)= returns the set of the client's live pop channels. Throws an
@@ -497,10 +504,10 @@ satisfy.
 =(end! client)= and =(end! client opts)= resolve with nil once the socket is closed:
 the pop feeds are stopped, the commands in flight are waited for, or cut with
 ={:force? true}= (they reject with =Disconnects client=; a forced =end!= also cuts a
-graceful one still waiting), and every channel of the client is closed once the
-connection ended. A second graceful =end!= resolves nil at once. Rejects with an
-argument-error for a non-client, a non-boolean or unknown option, or a client lent
-by a pool.
+graceful one still waiting, however many were called), and the promise settles only
+once every feed channel is closed and the on-end! hooks have run. A second graceful
+=end!= resolves when the first one does. Rejects with an argument-error for a
+non-client, a non-boolean or unknown option, or a client lent by a pool.
 
 ** redis-cljs.pool
 
@@ -524,7 +531,10 @@ argument-error for a non-pool.
 =(pool! config)= returns a pool handle at once, without connecting; =config= is a map
 of =redis-cljs.util/pool-config-keys= (every client key plus =:minimum :maximum
 :acquire-timeout-ms :cleanup-delay-ms=) or =(from-env)=. Throws a config-error for an
-unknown key, a wrong value, =:minimum= above =:maximum= or neither =:url= nor =:host=.
+unknown key, a wrong value, =:minimum= above =:maximum=, neither =:url= nor =:host=,
+or a =:url= upstream cannot use (checked at =pool!= on a throwaway client that never
+connects, so that a pool's =connect!= never reports a configuration as a
+network-error).
 
 **** redis-cljs.pool/connect!
 =(connect! pool)= resolves with the pool handle once =:minimum= clients are ready.
@@ -711,8 +721,9 @@ runs.
 
 **** redis-cljs.util/check-config!
 =(check-config! config)= returns =config= when every key is a client key, every
-value has the right shape and =:url= or =:host= is present; throws a config-error
-(its =:received= redacted) otherwise.
+value has the right shape, a =:url= parses with a host, a port in range, an integer
+database and a scheme consistent with =:tls=, and =:url= or =:host= is present; throws
+a config-error (its =:received= redacted) otherwise.
 
 **** redis-cljs.util/check-pool-config!
 =(check-pool-config! config)= returns =config= under the same rules with the pool
@@ -721,21 +732,27 @@ keys allowed and checked, =:minimum= not above =:maximum=.
 **** redis-cljs.util/config->upstream
 =(config->upstream config)= returns the nested map keyed by node-redis's option
 names, with =RESP 2= and =maintNotifications "disabled"= added. Throws an
-argument-error for a key outside =pool-config-keys=.
+argument-error for a map =check-pool-config!= would refuse.
 
 **** redis-cljs.util/pool-config->upstream
 =(pool-config->upstream config)= returns =[client-options pool-options]=.
 
 **** redis-cljs.util/redacted
 =(redacted config)= returns the configuration with =:password= replaced by ="***"=,
-the password part of a =:url= hidden, and =:key= and =:passphrase= of =:tls-options=
-replaced by ="***"=; a bare URL string with its password hidden; anything else as it
-is.
+the password part of a =:url= hidden (up to the last =@=, so a password holding =@=
+is masked whole), =:key= and =:passphrase= of =:tls-options= replaced by ="***"=, and
+a =:url= or =:tls-options= of another type masked whole; a bare URL string with its
+password hidden; anything else as it is.
 
 **** redis-cljs.util/unwrap-env-value
 =(unwrap-env-value v)= returns the string trimmed and stripped of one layer of
-matching quotes (double, single or back), nil for a blank or non-string input or a
-quoted empty string.
+matching quotes (double, single or back), what the quotes held kept as it is (a
+quoted empty string is the empty string), nil for a blank or non-string input.
+
+**** redis-cljs.util/parse-url
+=(parse-url url)= returns the parts of a =:url= as node-redis reads them, ={:tls?
+:username :password :host :port :database}= (the absent parts absent), nil for a
+string that does not parse (whitespace, no host, a non-numeric port or database).
 
 **** redis-cljs.util/parse-integer
 =(parse-integer s)= returns the non-negative integer a string of decimal digits

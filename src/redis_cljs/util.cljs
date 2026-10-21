@@ -242,26 +242,48 @@
 ;; Redaction
 ;; ---------------------------------------------------------------------------
 
+(def ^:private url-password-pattern
+  "The password part of a URL: from the colon after the username to the
+   LAST @ before the path, so a password holding @ itself is masked
+   whole (node-redis reads the authority the same way: the last @ ends
+   the credentials)."
+  #"://([^:/@]*):[^/]*@")
+
+(defn- redact-url
+  "A URL string with its password masked; anything that is not a string
+   masked whole (an invalid :url value may still hold a secret)."
+  [url]
+  (if (string? url)
+    (str/replace url url-password-pattern "://$1:***@")
+    "***"))
+
+(defn- redact-tls-options
+  "A :tls-options map with :key and :passphrase masked; anything that is
+   not a map masked whole."
+  [tls]
+  (if (map? tls)
+    (cond-> tls
+      (contains? tls :key) (assoc :key "***")
+      (contains? tls :passphrase) (assoc :passphrase "***"))
+    "***"))
+
 (defn redacted
   "The configuration without its secrets: :password replaced by \"***\",
    the password part of a :url hidden, and :key and :passphrase of
-   :tls-options replaced by \"***\", and the password part of a bare URL
-   string hidden. Applied wherever a configuration is printed (a handle)
-   or carried in an error. Anything else is returned as it is."
+   :tls-options replaced by \"***\" (a :url or :tls-options of another type
+   masked whole), and the password part of a bare URL string hidden.
+   Applied wherever a configuration is printed (a handle) or carried in
+   an error. Anything else is returned as it is."
   [config]
   (cond
     (map? config)
     (cond-> config
       (contains? config :password) (assoc :password "***")
-      (string? (:url config)) (update :url str/replace #"://([^:/@]*):[^@]*@" "://$1:***@")
-      (map? (:tls-options config)) (update :tls-options
-                                           (fn [tls]
-                                             (cond-> tls
-                                               (contains? tls :key) (assoc :key "***")
-                                               (contains? tls :passphrase) (assoc :passphrase "***")))))
+      (contains? config :url) (update :url redact-url)
+      (contains? config :tls-options) (update :tls-options redact-tls-options))
 
     ;; a bare string may be a URL with a password in it
-    (string? config) (str/replace config #"://([^:/@]*):[^@]*@" "://$1:***@")
+    (string? config) (redact-url config)
 
     :else config))
 
@@ -273,8 +295,8 @@
   "The value of configuration key `k` as an error may carry it."
   [k v]
   (cond
-    (= :url k) (:url (redacted {:url v}))
-    (= :tls-options k) (:tls-options (redacted {:tls-options v}))
+    (= :url k) (redact-url v)
+    (= :tls-options k) (redact-tls-options v)
     (contains? secret-config-keys k) "***"
     :else v))
 
@@ -346,16 +368,74 @@
   [v]
   (or (boolean? v) (non-negative-number? v) (fn? v)))
 
+(def ^:private digit-values
+  {"0" 0 "1" 1 "2" 2 "3" 3 "4" 4 "5" 5 "6" 6 "7" 7 "8" 8 "9" 9})
+
+(defn parse-integer
+  "The non-negative integer written by a string of decimal digits, nil for
+   anything else (an empty string, a sign, other characters). Pure."
+  [s]
+  (when (and (string? s) (re-matches #"[0-9]+" s))
+    (reduce (fn [n c] (+ (* n 10) (get digit-values c))) 0 s)))
+
 (def url-pattern
-  "The shape of a :url: redis:// or rediss://, then at least one character
-   that is not whitespace. The parts are parsed by node-redis; a URL it
-   cannot parse is a config-error at connect!."
-  #"^rediss?://\S+$")
+  "The shape of a :url, as node-redis reads it: redis:// or rediss://, an
+   optional [username][:password]@ (the LAST @ before the path ends the
+   credentials, so a password may hold @), a host with an optional :port,
+   an optional /database, an optional ?query. Groups: scheme, credentials,
+   host and port, database."
+  #"^(rediss?)://(?:([^/?#]*)@)?([^/?#@]*)(?:/([^?#]*))?(?:\?.*)?$")
+
+(defn parse-url
+  "The parts of a :url as node-redis reads them: {:tls? b :username s
+   :password s :host s :port n :database n}, the absent parts absent;
+   nil when the string holds whitespace or does not match url-pattern,
+   when the port or the database is not a string of digits, or when the
+   host is empty (a bracketed IPv6 host is kept with its brackets). Pure; the parsed parts
+   are checked by check-config! like the explicit keys."
+  [url]
+  (when (and (string? url) (not (re-find #"\s" url)))
+    (when-let [[_ scheme credentials host-port database] (re-matches url-pattern url)]
+      (let [[host port] (if (str/starts-with? host-port "[")
+                          (let [[_ h p] (re-matches #"(\[[^\]]*\])(?::(.*))?" host-port)] [h p])
+                          (let [i (str/last-index-of host-port ":")]
+                            (if (nil? i) [host-port nil] [(subs host-port 0 i) (subs host-port (inc i))])))
+            [username password] (when credentials
+                                   (let [i (str/index-of credentials ":")]
+                                     (if (nil? i) [credentials nil] [(subs credentials 0 i) (subs credentials (inc i))])))
+            port-n (when (some? port) (parse-integer port))
+            database-n (when (some? database) (parse-integer database))]
+        (when (and (seq host)
+                   (or (nil? port) (some? port-n))
+                   (or (nil? database) (some? database-n)))
+          (cond-> {:tls? (= "rediss" scheme) :host host}
+            (some? username) (assoc :username username)
+            (some? password) (assoc :password password)
+            (some? port-n) (assoc :port port-n)
+            (some? database-n) (assoc :database database-n)))))))
+
+(defn- check-url!
+  "The :url of `config`, parsed and checked as the explicit keys are: a
+   config-error naming :url for a string that does not parse (a non-digit
+   port or database, an empty host), :port for a port out of range,
+   :database for a database out of range, :tls for a :tls key that
+   contradicts the scheme."
+  [function config]
+  (when (contains? config :url)
+    (let [url (:url config)
+          parsed (parse-url url)]
+      (when-not parsed
+        (throw (config-error function :url
+                             "a string of the form redis://[[username][:password]@]host[:port][/db] (rediss:// for TLS) with a host, a numeric port and a numeric database"
+                             (redact-url url))))
+      (when (and (contains? parsed :port) (not (port? (:port parsed))))
+        (throw (config-error function :port "an integer between 1 and 65535 (in :url)" (:port parsed))))
+      (when (and (contains? config :tls) (not= (:tls config) (:tls? parsed)))
+        (throw (config-error function :tls "consistent with the scheme of :url (rediss:// for true, redis:// for false)" (:tls config)))))))
 
 (defn- check-values!
   [function config]
-  (check-value! function :url #(and (string? %) (re-matches url-pattern %))
-                "a string of the form redis://[[username][:password]@][host][:port][/db] (rediss:// for TLS)" config)
+  (check-url! function config)
   (check-value! function :host non-blank? "a non-blank string" config)
   (check-value! function :port port? "an integer between 1 and 65535" config)
   (check-value! function :tls boolean? "true or false" config)
@@ -386,10 +466,12 @@
 (defn check-config!
   "Throws a config-error when `config` (already normalized) is not a map,
    has a key outside client-config-keys, a value of the wrong shape, a
-   :tls-options map with a key outside tls-option-keys, or neither :url nor
-   :host. Returns `config`. Upstream silently ignores unknown option names
-   and connects to localhost by default; redis-cljs fails before anything
-   is sent. The error's :received is redacted."
+   :tls-options map with a key outside tls-option-keys, a :url that does
+   not parse or whose host, port, database or scheme fail the same checks
+   as the explicit keys, or neither :url nor :host. Returns `config`.
+   Upstream silently ignores unknown option names and connects to
+   localhost by default; redis-cljs fails before anything is sent. The
+   error's :received is redacted."
   [config]
   (let [function 'redis-cljs.core/connect!]
     (check-keys! function :config client-config-keys config)
@@ -426,13 +508,19 @@
    names (strings), as node-redis reads it: the socket options under
    \"socket\", :tls-options spread into it through tls-option-keys, every
    other value verbatim, plus fixed-upstream-options (RESP 2, maintenance
-   notifications off). Pool-only keys are left out; any other key outside
-   client-config-keys is an argument-error (check-config! runs first on
-   the documented path, so this guards a direct call)."
+   notifications off). Pool-only keys are left out. A map that
+   check-pool-config! would refuse (an unknown key, a wrong value, a bad
+   :tls-options) is an argument-error: the documented path validates
+   first, this guards a direct call."
   [config]
   (check! 'redis-cljs.util/config->upstream :config
-          #(and (map? %) (every? (fn [k] (contains? pool-config-keys k)) (keys %)))
-          "a validated configuration map (keys of pool-config-keys)" (redacted config))
+          (fn [c]
+            (and (map? c)
+                 (try (check-keys! 'redis-cljs.util/config->upstream :config pool-config-keys c)
+                      (check-values! 'redis-cljs.util/config->upstream c)
+                      true
+                      (catch :default _ false))))
+          "a configuration map that check-pool-config! accepts" (redacted config))
   (reduce (fn [m [k v]]
             (if-let [path (get client-config-keys k)]
               (cond
@@ -461,32 +549,22 @@
 ;; ---------------------------------------------------------------------------
 
 (defn unwrap-env-value
-  "Copy-paste defense for a string read from the environment: trims
-   whitespace and strips ONE layer of matching quotes (double, single or
-   back quotes) when the value starts and ends with the same quote. Nothing
-   else is removed, so a password with a dash or a quote inside survives.
-   nil for a blank or non-string input, and for a quoted empty string.
-   from-env applies it to every variable it reads; values given in a
-   configuration map are never touched."
+  "Copy-paste defense for a string read from the environment: trims the
+   whitespace around the value and strips ONE layer of matching quotes
+   (double, single or back quotes) when it starts and ends with the same
+   quote. What the quotes held is kept as it is, spaces included, and a
+   quoted empty string is the empty string; nothing else is removed, so a
+   password with a dash or a quote inside survives. nil for a blank or
+   non-string input. from-env applies it to every variable it reads;
+   values given in a configuration map are never touched."
   [v]
   (let [v (when (string? v) (str/trim v))]
     (when-not (str/blank? v)
       (let [n (count v)
-            wrapped? (fn [q] (and (>= n 2) (str/starts-with? v q) (str/ends-with? v q)))
-            v (if (or (wrapped? "\"") (wrapped? "'") (wrapped? "`"))
-                (str/trim (subs v 1 (dec n)))
-                v)]
-        (when-not (str/blank? v) v)))))
-
-(def ^:private digit-values
-  {"0" 0 "1" 1 "2" 2 "3" 3 "4" 4 "5" 5 "6" 6 "7" 7 "8" 8 "9" 9})
-
-(defn parse-integer
-  "The non-negative integer written by a string of decimal digits, nil for
-   anything else (an empty string, a sign, other characters). Pure."
-  [s]
-  (when (and (string? s) (re-matches #"[0-9]+" s))
-    (reduce (fn [n c] (+ (* n 10) (get digit-values c))) 0 s)))
+            wrapped? (fn [q] (and (>= n 2) (str/starts-with? v q) (str/ends-with? v q)))]
+        (if (or (wrapped? "\"") (wrapped? "'") (wrapped? "`"))
+          (subs v 1 (dec n))
+          v)))))
 
 (defn env->config
   "The configuration map read from `env` (a map of variable name ->
@@ -494,12 +572,13 @@
    value unwrapped by unwrap-env-value, REDIS_PORT and REDIS_DATABASE
    parsed as non-negative integers, REDIS_TLS read through env-booleans
    (case-insensitively); a value that is none of these is a config-error
-   naming the key. Blank variables are absent. Pure:
+   naming the key. Blank variables are absent; a quoted empty string is
+   the empty string. Pure:
    redis-cljs.core/from-env reads the real environment."
   [env]
   (let [function 'redis-cljs.core/from-env]
     (reduce (fn [config [variable k]]
-              (if-let [v (unwrap-env-value (get env variable))]
+              (if-some [v (unwrap-env-value (get env variable))]
                 (assoc config k
                        (case k
                          (:port :database)
@@ -567,12 +646,14 @@
 (defn command->upstream
   "A validated command vector -> the vector of arguments node-redis sends:
    the command name upper-cased ([:hset ...] -> \"HSET\"; a multi-word name
-   such as \"CLIENT ID\" or :client-id is split into its words), then every
-   argument through the rules of argument->upstream: strings as they are,
-   keywords upper-cased, numbers as decimal text, and the objects
-   `wire-object?` accepts (none by default; the core passes the binding's
-   test for Buffers and BigInts) as they are. Throws an argument-error
-   with :index for any other argument."
+   such as \"CLIENT ID\" or :client-id is split into its words; a name
+   that is blank once normalized, such as :- or (keyword \"\"), is an
+   argument-error), then every argument through the rules of
+   argument->upstream: strings as they are, keywords upper-cased, numbers
+   as decimal text, and the objects `wire-object?` accepts (none by
+   default; the core passes the binding's test for Buffers and BigInts)
+   as they are. Throws an argument-error with :index for any other
+   argument."
   ([cmd] (command->upstream command-function cmd))
   ([function cmd] (command->upstream function cmd (constantly false)))
   ([function cmd wire-object?]
@@ -581,6 +662,9 @@
                    str/upper-case
                    str/trim
                    (str/split #"\s+"))]
+     (when (str/blank? (str/join " " words))
+       (throw (argument-error function :command "a vector whose first element names the command (a keyword or a non-blank string)"
+                              cmd {:index 0})))
      (into (vec words)
            (map-indexed (fn [i x] (argument->upstream function wire-object? (inc i) x)))
            (rest cmd)))))

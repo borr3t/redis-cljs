@@ -10,6 +10,7 @@
    opens a client against it. No Redis server, no network beyond the
    loopback interface."
   (:require [promesa.core :as p]
+            [redis-cljs.binding :as b]
             [redis-cljs.core :as core]
             [redis-cljs.fake-server :as fake]
             [redis-cljs.helpers :as helpers]
@@ -23,4 +24,4 @@
   (p/let [s (fake/start! {:script {"GET" "value"}})]
     (reset! server s)
     (println "fake server on port" (fake/port s) "; api-version" core/api-version)
-    (js/setInterval (fn [] nil) 60000)))
+    (b/keep-process-alive!)))

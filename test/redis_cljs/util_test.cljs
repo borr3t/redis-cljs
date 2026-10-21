@@ -95,6 +95,11 @@
       (is (not (str/includes? m "SYNTHETIC_SECRET")))))
   (testing "a whole configuration carried in an error is redacted"
     (doseq [config [{:host "h" :password "SYNTHETIC_SECRET" :timeout 5}
+                    {:url {:password "SYNTHETIC_SECRET"}}
+                    {:host "h" :tls-options "SYNTHETIC_SECRET"}
+                    {:url "redis://u:one@SYNTHETIC_SECRET@h:1" :port "x"}
+                    {:url "redis://u:SYNTHETIC_SECRET@h:notaport"}
+                    {:url "redis://u:SYNTHETIC_SECRET@h" :tls true}
                     {:password "SYNTHETIC_SECRET"}
                     {:host "h" :password "SYNTHETIC_SECRET" :tls-options {:key "SYNTHETIC_SECRET" :passphrase "SYNTHETIC_SECRET" :verify 1}}
                     {:url "redis://u:SYNTHETIC_SECRET@h x"}
@@ -107,6 +112,33 @@
   (testing "a non-map configuration holding a secret is redacted too"
     (is (not (str/includes? (pr-str (thrown-data #(util/connect-config "redis://u:SYNTHETIC_SECRET@h")))
                             "SYNTHETIC_SECRET")))))
+
+(deftest urls-are-parsed-and-checked-like-the-explicit-keys
+  (testing "parse-url"
+    (is (= {:tls? false :host "h"} (util/parse-url "redis://h")))
+    (is (= {:tls? true :username "u" :password "p" :host "h" :port 6380 :database 2}
+           (util/parse-url "rediss://u:p@h:6380/2?x=1")))
+    (is (= {:tls? false :username "u" :password "one@SECRET" :host "h"} (util/parse-url "redis://u:one@SECRET@h")))
+    (is (= {:tls? false :username "" :password "p" :host "h"} (util/parse-url "redis://:p@h")))
+    (is (= {:tls? false :host "[::1]" :port 6379} (util/parse-url "redis://[::1]:6379")))
+    (is (= {:tls? false :host "h" :port 0} (util/parse-url "redis://h:0")))
+    (doseq [bad ["redis:///0" "redis://" "redis://h:notaport" "redis://h/-1" "redis://h/1.5" "http://h" "redis://h x" nil 7]]
+      (is (nil? (util/parse-url bad)) (pr-str bad))))
+  (testing "the effective configuration is refused like the explicit keys"
+    (doseq [[config argument] [[{:url "redis:///0"} :url]
+                               [{:url "redis://h:0/0"} :port]
+                               [{:url "redis://h:70000"} :port]
+                               [{:url "redis://h/-1"} :url]
+                               [{:url "redis://h/1.5"} :url]
+                               [{:url "redis://h:notaport"} :url]
+                               [{:url "redis://h" :tls true} :tls]
+                               [{:url "rediss://h" :tls false} :tls]]]
+      (let [d (thrown-data #(util/check-config! (util/normalize-config config)))]
+        (is (= :redis-cljs/config-error (:type d)) (pr-str config))
+        (is (= argument (:argument d)) (pr-str config)))))
+  (testing "a consistent :tls passes"
+    (is (map? (util/check-config! (util/normalize-config {:url "rediss://h" :tls true}))))
+    (is (map? (util/check-config! (util/normalize-config {:url "redis://h:6380/3"}))))))
 
 (deftest check-pool-config-adds-the-pool-keys
   (let [cfg (util/normalize-config {:url "redis://h" :minimum 2 :maximum 4 :acquire-timeout-ms 10})]
@@ -145,10 +177,14 @@
     (is (= 250 (get-in (util/config->upstream (util/normalize-config {:host "h" :reconnect 250})) ["socket" "reconnectStrategy"])))
     (let [f (fn [_ _] 1)]
       (is (identical? f (get-in (util/config->upstream (util/normalize-config {:host "h" :reconnect f})) ["socket" "reconnectStrategy"])))))
-  (testing "an unknown key is refused, not dropped"
-    (let [d (thrown-data #(util/config->upstream {:host "h" :timeout 5}))]
-      (is (= :redis-cljs/argument-error (:type d)))
-      (is (= 'redis-cljs.util/config->upstream (:function d)))))
+  (testing "an unknown key, a wrong value or a bad :tls-options is refused, not dropped"
+    (doseq [config [{:host "h" :timeout 5} {:host 7} {:host "h" :tls-options 7}
+                    {:host "h" :tls-options {:verify 1}} "redis://h" nil]]
+      (let [d (thrown-data #(util/config->upstream config))]
+        (is (= :redis-cljs/argument-error (:type d)) (pr-str config))
+        (is (= 'redis-cljs.util/config->upstream (:function d)) (pr-str config))))
+    (is (not (str/includes? (pr-str (thrown-data #(util/config->upstream {:host "h" :tls-options {:key "SYNTHETIC_SECRET" :verify 1}})))
+                            "SYNTHETIC_SECRET"))))
   (testing "the pool split"
     (is (= [{"RESP" 2 "maintNotifications" "disabled" "socket" {"host" "h" "reconnectStrategy" false}}
             {"minimum" 2 "maximum" 4}]
@@ -156,6 +192,12 @@
 
 (deftest redaction-hides-every-secret
   (is (= {:host "h" :password "***"} (util/redacted {:host "h" :password "p"})))
+  (testing "a password holding @ is masked whole, up to the last @"
+    (is (= {:url "redis://u:***@h:1"} (util/redacted {:url "redis://u:one@SECRET@h:1"})))
+    (is (= "redis://u:***@h" (util/redacted "redis://u:one@two@SECRET@h"))))
+  (testing "a :url or :tls-options of the wrong type is masked whole"
+    (is (= {:url "***"} (util/redacted {:url {:password "SECRET"}})))
+    (is (= {:host "h" :tls-options "***"} (util/redacted {:host "h" :tls-options "PRIVATE_KEY"}))))
   (is (= {:url "redis://u:***@h:1/2"} (util/redacted {:url "redis://u:verysecret@h:1/2"})))
   (is (= {:url "redis://h:1"} (util/redacted {:url "redis://h:1"})))
   (is (= {:host "h" :tls-options {:ca "public" :key "***" :passphrase "***"}}
@@ -168,6 +210,9 @@
 
 (deftest unwrap-env-value-strips-one-layer-of-quotes
   (is (= "s3cret-" (util/unwrap-env-value "\"s3cret-\"")))
+  (is (= " secret " (util/unwrap-env-value "\" secret \"")) "what the quotes held is kept as it is")
+  (is (= "" (util/unwrap-env-value "\"\"")) "a quoted empty string is the empty string")
+  (is (= "" (util/unwrap-env-value "''")))
   (is (= "x" (util/unwrap-env-value " 'x' ")))
   (is (= "x" (util/unwrap-env-value "`x`")))
   (is (= "-x-" (util/unwrap-env-value "-x-")) "dashes are part of the value")
@@ -175,8 +220,6 @@
   (is (= "\"x\"" (util/unwrap-env-value "\"\"x\"\"")) "only one layer")
   (is (= "a\"" (util/unwrap-env-value "a\"")) "an unmatched quote stays")
   (is (= "'a\"" (util/unwrap-env-value "'a\"")) "quotes of different kinds stay")
-  (is (nil? (util/unwrap-env-value "\"\"")) "a quoted empty string is empty")
-  (is (nil? (util/unwrap-env-value "''")))
   (is (nil? (util/unwrap-env-value "   ")))
   (is (nil? (util/unwrap-env-value nil)))
   (is (nil? (util/unwrap-env-value 7))))
@@ -203,6 +246,8 @@
       (is (= :tls (:argument d)))
       (is (= "flase" (:received d)))))
   (is (= {} (util/env->config {"REDIS_HOST" "  "})) "a blank variable is absent")
+  (is (= {:password ""} (util/env->config {"REDIS_PASSWORD" "\"\""})) "a quoted empty string is a value")
+  (is (= :port (:argument (thrown-data #(util/env->config {"REDIS_PORT" "\"\""})))))
   (let [d (thrown-data #(util/env->config {"REDIS_PORT" "six"}))]
     (is (= :redis-cljs/config-error (:type d)))
     (is (= {:function 'redis-cljs.core/from-env :argument :port :received "six"}
@@ -245,6 +290,11 @@
   (is (= 0 (:index (thrown-data #(util/check-command! [42 "k"])))))
   (is (= 0 (:index (thrown-data #(util/check-command! ["" "k"])))) "a blank name")
   (is (= 0 (:index (thrown-data #(util/check-command! ["  " "k"])))))
+  (testing "a name blank once normalized"
+    (doseq [head [(keyword "") (symbol "") :- :-- "" " "]]
+      (let [d (thrown-data #(util/command->upstream [head "k"]))]
+        (is (= :redis-cljs/argument-error (:type d)) (pr-str head))
+        (is (= 0 (:index d)) (pr-str head)))))
   (is (= [:get "k"] (util/check-command! [:get "k"])))
   (testing "nil, booleans, collections, symbols and functions are refused with their index"
     (doseq [[cmd index] [[[:set "k" nil] 2] [[:set "k" true] 2] [[:rpush "q" ["a"]] 2] [[:set "k" {:a 1}] 2]

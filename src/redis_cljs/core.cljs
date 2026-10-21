@@ -159,7 +159,7 @@
    client; callers never need it. Throws an argument-error for a
    non-object or a non-boolean."
   [js-client pooled?]
-  (util/check! 'redis-cljs.core/wrap-client :js-client b/js-object? "an upstream client object" js-client)
+  (util/check! 'redis-cljs.core/wrap-client :js-client b/event-emitter? "an upstream client object (an event emitter)" js-client)
   (util/check! 'redis-cljs.core/wrap-client :pooled? boolean? "true or false" pooled?)
   (let [handle (->Client js-client (atom {:pooled? pooled? :end-hooks []}))
         ended (fn [& _] (run-end-hooks! handle))]
@@ -309,6 +309,31 @@
   [client ch]
   (get-in @(:state client) [:feeds ch]))
 
+(defn- finish-feed!
+  "Closes the channel of a feed and forgets it. What the channel holds
+   (its buffer, and a put still waiting for room) stays takeable until
+   exhausted, so nothing popped is lost."
+  [client ch]
+  (async/close! ch)
+  (swap! (:state client) update :feeds dissoc ch))
+
+(defn- settle-feed!
+  "Stops the feed of `ch`: no further pop is sent; resolves with nil once
+   the pop in flight, if any, has answered and the channel is closed."
+  [client ch feed]
+  (swap! feed assoc :stopped? true)
+  (p/then (or (:in-flight @feed) (p/create (fn [resolve _] (resolve nil))))
+          (fn [_]
+            (when (feed-of client ch) (finish-feed! client ch))
+            nil)))
+
+(defn- settle-feeds!
+  "settle-feed! for every live feed of the client; resolves with nil once
+   all are closed."
+  [client]
+  (p/then (p/all (mapv (fn [[ch feed]] (settle-feed! client ch feed)) (:feeds @(:state client))))
+          (fn [_] nil)))
+
 (defn- pop-feed!
   [function command client keys opts]
   (check-client! function client)
@@ -318,45 +343,36 @@
         ch (async/chan (async/buffer buffer-size))
         cmd (conj (into [command] ks) timeout-s)
         cmd-opts (when buffers? {:buffers? true})
-        ;; :stopped? no further pop is sent; :settled a promise of the pop
-        ;; in flight AND the acceptance of its item by the channel, nil
-        ;; when nothing is in flight
-        feed (atom {:stopped? false :settled nil})
-        finish! (fn []
-                  (async/close! ch)
-                  (swap! (:state client) update :feeds dissoc ch))]
+        ;; :stopped? no further pop is sent; :in-flight a promise resolved
+        ;; once the pop in flight has answered and its item (or error) has
+        ;; been handed to the channel, nil when nothing is in flight
+        feed (atom {:stopped? false :in-flight nil})]
     (letfn [(step []
               (when-not (or (:stopped? @feed) (impl/closed? ch))
-                (let [settled (p/create
-                               (fn [resolve _]
-                                 (-> (command! client cmd cmd-opts)
-                                     (p/then (fn [reply]
-                                               (if (nil? reply)
-                                                 (do (finish!) (resolve nil))
-                                                 (async/put! ch {:key (first reply) :value (second reply)}
-                                                             (fn [accepted?]
-                                                               (resolve nil)
-                                                               (when accepted? (step)))))))
-                                     (p/catch (fn [e]
-                                                (async/put! ch {:error e})
-                                                (finish!)
-                                                (resolve nil))))))]
-                  (swap! feed assoc :settled settled))))]
-      ;; on a client that already ended the one pop rejects at once and
-      ;; the error reaches the channel; a live client gets the hook that
-      ;; stops every feed when the connection ends
-      (when-not (:ended? @(:state client))
-        (swap! (:state client) assoc-in [:feeds ch] feed)
-        (when-not (:end-hook-for-feeds? @(:state client))
-          (swap! (:state client) assoc :end-hook-for-feeds? true)
-          (on-end! client (fn []
-                            (doseq [[ch feed] (:feeds @(:state client))]
-                              (swap! feed assoc :stopped? true)
-                              (p/then (or (:settled @feed) (p/create (fn [resolve _] (resolve nil))))
-                                      (fn [_]
-                                        (async/close! ch)
-                                        (swap! (:state client) update :feeds dissoc ch))))))))
-      (step))
+                (let [in-flight (p/create
+                                 (fn [resolve _]
+                                   (-> (command! client cmd cmd-opts)
+                                       (p/then (fn [reply]
+                                                 (if (nil? reply)
+                                                   (when (feed-of client ch) (finish-feed! client ch))
+                                                   (async/put! ch {:key (first reply) :value (second reply)}
+                                                               (fn [accepted?] (when accepted? (step)))))
+                                                 (resolve nil)))
+                                       (p/catch (fn [e]
+                                                  (async/put! ch {:error e})
+                                                  (when (feed-of client ch) (finish-feed! client ch))
+                                                  (resolve nil))))))]
+                  (swap! feed assoc :in-flight in-flight)
+                  (p/then in-flight (fn [_] (swap! feed (fn [f] (if (identical? (:in-flight f) in-flight) (assoc f :in-flight nil) f))))))))]
+      (if (:ended? @(:state client))
+        ;; on a client that already ended the one pop rejects at once and
+        ;; the error reaches the channel
+        (step)
+        (do (swap! (:state client) assoc-in [:feeds ch] feed)
+            (when-not (:end-hook-for-feeds? @(:state client))
+              (swap! (:state client) assoc :end-hook-for-feeds? true)
+              (on-end! client (fn [] (settle-feeds! client))))
+            (step))))
     ch))
 
 (defn brpop!
@@ -371,8 +387,9 @@
    - a pop times out (:timeout-s elapsed with nothing to pop; 0, the
      default, never times out): the channel is closed, a take yields nil;
    - stop-feed! is called: no further pop is sent, the pop in flight is
-     waited for and its item, if any, delivered, then the channel is
-     closed; drain what is left;
+     waited for and its item, if any, handed to the channel, then the
+     channel is closed; what the channel holds stays takeable until
+     exhausted, a put still waiting for room included: drain until nil;
    - the client ends (end!, or the connection gone for good): the same as
      stop-feed!, run by the library;
    - a rejection: the error (a :redis-cljs/api-error for a WRONGTYPE
@@ -402,29 +419,27 @@
 (defn stop-feed!
   "Stops the pop feed of channel `ch` (a channel brpop! or blpop! returned
    for `client`): no further pop is sent; the pop in flight, if any, is
-   waited for (up to its :timeout-s) and its item delivered to the
-   channel; then the channel is closed. Resolves with nil once the channel
-   is closed: take what is still buffered afterwards, nothing popped is
-   lost. A channel whose feed already finished (timed out, errored,
-   stopped) resolves nil at once. Rejects with an argument-error for a
-   non-client or a channel that is not a feed of this client. The wait
-   can be long when the pop blocks without limit and the queue stays
-   empty: give a feed a :timeout-s when it must stop promptly."
+   waited for (up to its :timeout-s) and its item handed to the channel;
+   then the channel is closed. Resolves with nil once the channel is
+   closed. What the channel holds stays takeable until exhausted, a put
+   still waiting for room included (a full buffer never makes stop-feed!
+   wait): drain until nil afterwards, nothing popped is lost. A channel
+   whose feed already finished (timed out, errored, stopped, closed)
+   resolves nil at once. Rejects with an argument-error for a non-client
+   or a channel that is neither a feed of this client nor a closed
+   channel. The wait can be long when the pop blocks without limit and
+   the queue stays empty: give a feed a :timeout-s when it must stop
+   promptly."
   [client ch]
   (util/run-op identity
                (fn []
                  (check-client! 'redis-cljs.core/stop-feed! client)
                  (if-let [feed (feed-of client ch)]
-                   (do (swap! feed assoc :stopped? true)
-                       (p/then (or (:settled @feed) (p/create (fn [resolve _] (resolve nil))))
-                               (fn [_]
-                                 (async/close! ch)
-                                 (swap! (:state client) update :feeds dissoc ch)
-                                 nil)))
-                   (if (impl/closed? ch)
+                   (settle-feed! client ch feed)
+                   (if (and (satisfies? impl/Channel ch) (impl/closed? ch))
                      nil
                      (throw (util/argument-error 'redis-cljs.core/stop-feed! :ch
-                                                 "a channel returned by brpop! or blpop! for this client" ch)))))))
+                                                 "a channel returned by brpop! or blpop! for this client, or a closed channel" ch)))))))
 
 (defn feeds
   "The live pop channels of the client (feeds not yet finished), as a set
@@ -449,13 +464,15 @@
    with {:force? true} the socket is destroyed at once, whether or not a
    graceful end! is still waiting, and every pending command rejects with
    a network-error (\"Disconnects client\"). The pop feeds of the client
-   are stopped first (no further pop is sent; the one in flight delivers
-   its item) and, once the connection has ended, every channel of the
-   client (feeds, pub/sub) is closed. After end! every command! rejects
+   are stopped first (no further pop is sent; the one in flight hands its
+   item to its channel) and end! resolves only once every feed channel is
+   closed (what they hold stays takeable) and the on-end! hooks have run,
+   which close the pub/sub channels. After end! every command! rejects
    with a network-error (\"The client is closed\"), status is :closed, and
-   the client cannot be reconnected. A second graceful end! resolves nil
-   at once. A client lent by redis-cljs.pool/with-client! is not ended
-   here but returned by the pool: an argument-error."
+   the client cannot be reconnected. A second graceful end! resolves when
+   the first one does; a forced end! after a graceful one cuts the wait.
+   A client lent by redis-cljs.pool/with-client! is not ended here but
+   returned by the pool: an argument-error."
   ([client] (end! client nil))
   ([client opts]
    (util/run-op (partial ->network-error :end)
@@ -464,22 +481,28 @@
                   (util/check-options! 'redis-cljs.core/end! end-options opts)
                   (util/check! 'redis-cljs.core/end! :client (complement (comp :pooled? deref :state))
                                "a client of connect! (a pooled client is returned by with-client!)" client)
-                  (let [state (:state client)]
+                  (let [state (:state client)
+                        settled (fn [] (settle-feeds! client))
+                        finish (fn [_] (p/then (settled) (fn [_] (run-end-hooks! client) nil)))]
                     (doseq [[_ feed] (:feeds @state)]
                       (swap! feed assoc :stopped? true))
                     (cond
-                      (:ended? @state) nil
-
                       (:force? opts)
-                      (do (swap! state assoc :closing? true)
-                          (b/destroy (:js client))
-                          (run-end-hooks! client)
-                          nil)
+                      (if (:ended? @state)
+                        (finish nil)
+                        (do (swap! state assoc :closing? true)
+                            (b/destroy (:js client))
+                            (finish nil)))
 
-                      (or (:closing? @state) (= :closed (status client)))
-                      (do (run-end-hooks! client) nil)
+                      (:closing? @state)
+                      (if-let [closing (:closing @state)]
+                        (p/then closing (fn [_] nil))
+                        (finish nil))
+
+                      (or (:ended? @state) (= :closed (status client)))
+                      (finish nil)
 
                       :else
-                      (do (swap! state assoc :closing? true)
-                          (p/then (b/close (:js client))
-                                  (fn [_] (run-end-hooks! client) nil)))))))))
+                      (let [closing (p/then (b/close (:js client)) finish)]
+                        (swap! state assoc :closing? true :closing closing)
+                        closing)))))))

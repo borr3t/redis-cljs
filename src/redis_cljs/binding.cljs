@@ -130,6 +130,21 @@
        (not (coll? x))
        (not (record? x))))
 
+(defn event-emitter?
+  "True for a JavaScript object with `on` and `removeListener` functions:
+   what an upstream client or pool is, and what a listener can be
+   attached to."
+  [x]
+  (and (js-object? x)
+       (fn? (unchecked-get x "on"))
+       (fn? (unchecked-get x "removeListener"))))
+
+(defn keep-process-alive!
+  "An interval timer that keeps the Node process alive (for a runtime a
+   REPL attaches to); returns the timer."
+  []
+  (js/setInterval (fn [] nil) 60000))
+
 ;; ---------------------------------------------------------------------------
 ;; CLJS -> JS (configuration, commands)
 ;; ---------------------------------------------------------------------------

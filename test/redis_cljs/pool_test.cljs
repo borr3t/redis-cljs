@@ -73,6 +73,16 @@
   (is (= :minimum (:argument (thrown-data #(pool/pool! {:host "h" :minimum "1"})))))
   (is (= :maximum (:argument (thrown-data #(pool/pool! {:host "h" :minimum 3 :maximum 1})))) ":minimum above :maximum")
   (is (= "***" (:received (thrown-data #(pool/pool! {:host "h" :password {:token "SYNTHETIC_SECRET"}})))))
+  (testing "a URL the pool's clients could not use is refused at pool!, redacted"
+    (doseq [[config argument] [[{:url "redis://u:SYNTHETIC_SECRET@h" :tls true} :tls]
+                               [{:url "redis://u:SYNTHETIC_SECRET@h:notaport"} :url]
+                               [{:url "redis:///0"} :url]]]
+      (let [d (thrown-data #(pool/pool! config))
+            m (try (pool/pool! config) nil (catch :default e (ex-message e)))]
+        (is (= :redis-cljs/config-error (:type d)) (pr-str config))
+        (is (= argument (:argument d)) (pr-str config))
+        (is (not (str/includes? (pr-str d) "SYNTHETIC_SECRET")) (pr-str config))
+        (is (not (str/includes? m "SYNTHETIC_SECRET")) (pr-str config)))))
   (is (= :redis-cljs/config-error (:type (thrown-data #(pool/pool! 42))))))
 
 (deftest connect-command-and-with-client

@@ -8,11 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- The client surface: `connect!` (a kebab-case config map, a `redis://` URL or
-  `(from-env)`), `command!` (commands as vectors, replies as the data the server
-  sent, `:buffers?` for Buffers), `brpop!` / `blpop!` (blocking pops as a core.async
-  channel feed), `end!`, `status`, `last-error`, `on-end!`, `client?`,
-  `api-version`.
+- The client surface: `connect!` (a kebab-case config map, a `redis://` URL under
+  `:url`, or `(from-env)`), `command!` (commands as vectors, replies as the data the
+  server sent, `:buffers?` for Buffers, a mixed EXEC reply with its failures as
+  `:redis-cljs/warnings` metadata), `brpop!` / `blpop!` (blocking pops as a
+  core.async channel feed) with `stop-feed!` and `feeds`, `end!` (graceful or
+  forced), `status`, `last-error`, `on-end!`, `client?`, `api-version`.
 - Pub/sub as core.async channels in `redis-cljs.pubsub`: `subscribe!`,
   `unsubscribe!`, `subscribed`, `publish!`; the protocol confirmations never reach
   a channel.

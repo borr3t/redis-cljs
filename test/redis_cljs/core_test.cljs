@@ -3,8 +3,8 @@
    the REAL node-redis client speaks RESP2 to a scripted net.Server on a
    free port of 127.0.0.1, so connect!, command!, brpop! and end! run end
    to end with no Redis server and no network beyond the loopback
-   interface. The one other socket opened goes to 127.0.0.1:9, which
-   refuses."
+   interface. The one other socket opened goes to a port of 127.0.0.1
+   that the fake bound and released, which refuses."
   (:require [cljs.test :refer [deftest is testing async]]
             [cljs.core.async :as async]
             [cljs.core.async.impl.protocols :as impl]
@@ -167,6 +167,11 @@
                     blank-host (failure (core/connect! {:host "" :port (fake/port server)}))
                     negative-db (failure (core/connect! (fake/config server {:database -1})))
                     bad-url (failure (core/connect! {:url "redis://127.0.0.1:notaport"}))
+                    empty-host (failure (core/connect! {:url "redis:///0"}))
+                    port-zero (failure (core/connect! {:url "redis://127.0.0.1:0/0"}))
+                    negative-url-db (failure (core/connect! {:url "redis://127.0.0.1/-1"}))
+                    fractional-db (failure (core/connect! {:url "redis://127.0.0.1/1.5"}))
+                    tls-mismatch (failure (core/connect! {:url (fake/url server) :tls true}))
                     secret (failure (core/connect! (fake/config server {:password {:token "SYNTHETIC_SECRET"}})))]
               (is (= :redis-cljs/config-error (:type unknown)))
               (is (= #{:timeout} (:unknown unknown)))
@@ -180,6 +185,11 @@
               (is (= :database (:argument negative-db)))
               (is (= :redis-cljs/config-error (:type bad-url)) "a URL node-redis cannot parse")
               (is (= {:function 'redis-cljs.core/connect! :argument :url} (select-keys bad-url [:function :argument])))
+              (is (= :url (:argument empty-host)) "an empty host in a URL is refused")
+              (is (= :port (:argument port-zero)))
+              (is (= :url (:argument negative-url-db)))
+              (is (= :url (:argument fractional-db)))
+              (is (= :tls (:argument tls-mismatch)))
               (is (= "***" (:received secret)))
               (is (not (str/includes? (pr-str secret) "SYNTHETIC_SECRET")))
               (is (not (str/includes? (:message secret) "SYNTHETIC_SECRET")))
@@ -189,7 +199,7 @@
 (deftest a-refused-connection-is-a-network-error
   ;; the port is one the fake just bound and released, so nothing listens
   ;; on it; this is the one socket of the suite that does not go to a fake
-  ;; server.
+  ;; server
   (async done
     (run done
       (fn []
@@ -564,6 +574,43 @@
                 (is (= 'redis-cljs.core/stop-feed! (:function not-client)))
                 (is (= :client (:argument not-client)))))))))))
 
+(deftest stop-feed-never-waits-for-a-full-buffer
+  ;; a buffer of one: one item buffered, the next put waiting for room;
+  ;; stop-feed! awaited BEFORE draining resolves, and the drain yields
+  ;; both items
+  (async done
+    (run done
+      (fn []
+        (with-server {"BRPOP" (fake/in-order ["q" "1"] ["q" "2"] ["q" "3"])}
+          (fn [server]
+            (p/let [client (core/connect! (fake/config server))
+                    ch (core/brpop! client "q" {:buffer-size 1})
+                    _ (p/delay 50)
+                    sent (count (fake/commands server))
+                    stopped (core/stop-feed! client ch)
+                    drained (take-while some? (repeatedly #(async/poll! ch)))
+                    _ (core/end! client)]
+              (is (= 2 sent) "the second pop's put waits for room; no third pop")
+              (is (nil? stopped))
+              (is (= [{:key "q" :value "1"} {:key "q" :value "2"}] drained) "nothing popped is lost")
+              (is (impl/closed? ch)))))))))
+
+(deftest stop-feed-checks-its-channel-first
+  (async done
+    (run done
+      (fn []
+        (with-server {}
+          (fn [server]
+            (p/let [client (core/connect! (fake/config server))
+                    results (p/all (mapv (fn [x] (p/catch (core/stop-feed! client x) ex-data)) [nil 7 "x" (async/chan)]))
+                    closed (core/stop-feed! client (doto (async/chan) async/close!))
+                    _ (core/end! client)]
+              (doseq [d results]
+                (is (= :redis-cljs/argument-error (:type d)))
+                (is (= :ch (:argument d)))
+                (is (= 'redis-cljs.core/stop-feed! (:function d))))
+              (is (nil? closed) "a closed channel is a finished feed"))))))))
+
 (deftest a-graceful-end-stops-the-feeds-and-closes-them
   (async done
     (run done
@@ -579,6 +626,19 @@
               (is (impl/closed? ch))
               (is (= 1 (count (fake/commands server))))
               (is (= #{} (core/feeds client))))))))))
+
+(deftest end-resolves-once-the-feeds-are-closed
+  (async done
+    (run done
+      (fn []
+        (with-server {"BRPOP" (fake/delayed 40 ["q" "1"])}
+          (fn [server]
+            (p/let [client (core/connect! (fake/config server))
+                    ch (core/brpop! client "q" {:buffer-size 1})
+                    _ (core/end! client)]
+              (is (impl/closed? ch) "closed by the time end! resolved")
+              (is (= #{} (core/feeds client)))
+              (is (= [{:key "q" :value "1"}] (take-while some? (repeatedly #(async/poll! ch))))))))))))
 
 (deftest a-pop-error-arrives-on-the-channel
   (async done
@@ -669,6 +729,27 @@
               (is (= "Disconnects client" (:message cut)))
               (is (= :closed (core/status client))))))))))
 
+(deftest a-second-graceful-end-does-not-disable-the-forced-one
+  (async done
+    (run done
+      (fn []
+        (with-server {"BRPOP" (fake/delayed 5000 ["q" "never"])}
+          (fn [server]
+            (p/let [client (core/connect! (fake/config server))
+                    [first-end second-end cut] (let [pending (p/catch (core/command! client [:brpop "q" 0]) ex-data)
+                                                     first-end (core/end! client)
+                                                     second-end (core/end! client)]
+                                                 (p/let [_ (p/delay 30)
+                                                         _ (core/end! client {:force? true})
+                                                         a first-end
+                                                         b second-end
+                                                         c pending]
+                                                   [a b c]))]
+              (is (nil? first-end))
+              (is (nil? second-end) "the second graceful end! resolved with the first")
+              (is (= "Disconnects client" (:message cut)) "the forced end! destroyed the socket")
+              (is (= :closed (core/status client))))))))))
+
 (deftest a-broken-connection-is-recorded-and-closes-every-channel
   (async done
     (run done
@@ -752,6 +833,8 @@
                     bad-arg (rejected (core/command! client [:set "k" nil]))
                     fn-arg (rejected (core/command! client [:set "k" (fn [] "v")]))
                     blank-name (rejected (core/command! client ["" "k"]))
+                    blank-keyword (rejected (core/command! client [(keyword "") "k"]))
+                    dash-name (rejected (core/command! client [:- "k"]))
                     bad-opts (rejected (core/command! client [:get "k"] {:buffer true}))
                     end-not-client (rejected (core/end! 7))
                     end-opts (rejected (core/end! client {:now true}))
@@ -761,6 +844,8 @@
                                               [bad-arg 'redis-cljs.core/command! :command]
                                               [fn-arg 'redis-cljs.core/command! :command]
                                               [blank-name 'redis-cljs.core/command! :command]
+                                              [blank-keyword 'redis-cljs.core/command! :command]
+                                              [dash-name 'redis-cljs.core/command! :command]
                                               [bad-opts 'redis-cljs.core/command! :opts]
                                               [end-not-client 'redis-cljs.core/end! :client]
                                               [end-opts 'redis-cljs.core/end! :opts]]]
@@ -786,7 +871,8 @@
                                                 [#(core/blpop! client [] nil) 'redis-cljs.core/blpop! :keys]
                                                 [#(core/feeds 1) 'redis-cljs.core/feeds :client]
                                                 [#(core/wrap-client {:a 1} false) 'redis-cljs.core/wrap-client :js-client]
-                                                [#(core/wrap-client (js-obj) "no") 'redis-cljs.core/wrap-client :pooled?]]]
+                                                [#(core/wrap-client (js-obj) false) 'redis-cljs.core/wrap-client :js-client]
+                                                [#(core/wrap-client (:js client) "no") 'redis-cljs.core/wrap-client :pooled?]]]
                   (let [d (thrown-data f)]
                     (is (= :redis-cljs/argument-error (:type d)) (str function " " argument))
                     (is (= function (:function d)))

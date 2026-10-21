@@ -14,8 +14,9 @@
 # server or a secrets file: `npm install` (first run only) fetches the toolchain
 # plus `redis`; the REAL node-redis client speaks RESP2 to the fake server of
 # test/redis_cljs/fake_server.cljs, a net.Server on a free port of 127.0.0.1
-# that answers from a scripted table. The one other socket opened goes to
-# 127.0.0.1:9 to prove a refused connection is reported.
+# that answers from a scripted table. The one other socket opened goes to a
+# port of 127.0.0.1 that the fake bound and released, to prove a refused
+# connection is reported.
 #
 # The publicity gate runs FIRST: src/ and README.md are public documentation.
 set -euo pipefail
