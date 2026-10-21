@@ -1,0 +1,17 @@
+{
+  "name": "redis-cljs",
+  "version": "0.1.0",
+  "description": "ClojureScript (Node.js) Redis client library over `redis` (node-redis): a thin faithful wrapper of the client and the client pool, commands as data, pub/sub and blocking pops as core.async channels; kebab-case maps in/out, promesa promises; JS interop confined to one binding namespace",
+  "private": true,
+  "license": "Unlicense",
+  "scripts": {
+    "test": "./run-tests.sh"
+  },
+  "dependencies": {
+    "redis": "6.3.0"
+  },
+  "devDependencies": {
+    "shadow-cljs": "^2.28.23",
+    "source-map-support": "^0.5.21"
+  }
+}

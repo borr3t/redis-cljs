@@ -1,0 +1,815 @@
+#+TITLE: redis-cljs — the manual
+#+OPTIONS: toc:3
+
+* Introduction
+
+redis-cljs is a thin, faithful ClojureScript (Node.js) wrapper of node-redis, the
+=redis= npm package. It adds no behavior of its own to what the server and node-redis
+do: it translates a kebab-case configuration map into node-redis's options, a command
+vector into the arguments node-redis sends, a reply into ClojureScript data, an error
+into an =ex-info= of one taxonomy, and a stream of messages or pops into a core.async
+channel. What it refuses to do is as deliberate as what it does: it never
+reinterprets a value (no JSON, no number parsing, no keywordizing of keys), never
+retries, never reconnects unless asked, never reads a file, and never connects to a
+host the configuration did not name.
+
+The README is the tour: what it is, the offline quick start with the printed results,
+the scenarios, the error table, the features and the settings. This manual is the
+rest: the concepts behind the surface, the gotchas of node-redis and of the protocol
+that the library handles, how the library is tested, the evidence that the suite can
+fail, and the reference of every public function. The docstrings of =src/redis_cljs/=
+say the same things, function by function.
+
+* Quick start
+
+#+begin_src bash
+npm install
+npx shadow-cljs compile examples && node target/examples.js
+#+end_src
+
+runs =dev/redis_cljs/examples.cljs= against the scripted fake server of the test suite
+on a free port of the loopback interface, and prints the results the README shows.
+Against a server of yours, the same functions take a configuration with your host:
+
+#+begin_src clojure
+(require '[redis-cljs.core :as redis]
+         '[promesa.core :as p])
+
+(p/let [client (redis/connect! {:host "cache.example.test" :port 6379 :password "..."})
+        _      (redis/command! client [:set "greeting" "hello" :ex 60])
+        value  (redis/command! client [:get "greeting"])
+        _      (redis/end! client)]
+  value)
+;; => "hello"
+#+end_src
+
+The library is consumed as a source dependency (=io.github.borr3t/redis-cljs= with
+=:local/root= or a git coordinate in the consumer's =deps.edn=); the npm side is the
+consumer's own =package.json= with =redis= 6.3.0, from which node resolves the
+module at run time. A configuration is always a map: a URL goes under =:url=, and
+=(redis/from-env)= builds the map from the =REDIS_*= variables.
+
+* Concepts
+
+** The client handle
+
+=connect!= resolves with a handle: a record holding the node-redis client and a state
+atom (the last error event, whether the client was lent by a pool, the live pub/sub
+subscriptions and pop feeds, the hooks to run when the connection ends). Everything a
+caller needs is a function of the handle: =status= (read live off node-redis's flags:
+=:ready=, =:connecting=, =:closed=), =last-error=, =command!=, =brpop!=, =blpop!=,
+=stop-feed!=, =feeds=, =end!=. Printing a handle shows host, port, database, name and
+status, never the password. A handle is single-use: once ended it cannot reconnect,
+=connect!= again. A pool keeps one handle per upstream client and lends the same one
+every time.
+
+** Commands as data
+
+A command is a vector whose first element names the command and whose other elements
+are its arguments: =[:set "key" "value" :ex 60 :nx]=. The name is upper-cased (a
+keyword's dashes become spaces: =[:client-id]= is =CLIENT ID=); a string or Buffer
+argument is sent as it is; a keyword argument is sent as its upper-cased name, which
+is how modifiers (=:ex=, =:nx=, =:match=, =:withscores=) are written; a number is sent
+as its decimal text; a BigInt as its decimal text. nil, booleans and ClojureScript
+collections have no representation on the wire that the caller wrote, so they are an
+argument-error. Nothing else is done to a value: a map to store is JSON the caller
+serialized, a number stored is the string it came back as.
+
+** Replies as data
+
+A reply is what the server sent, by RESP2 type: a simple string (=+OK=) as a string, a
+bulk string as a string (or a Buffer with ={:buffers? true}=), an integer as a number,
+a null bulk string or null array as nil, an array as a vector of these. Under RESP2 a
+hash reply (=HGETALL=) is a flat vector of field, value, field, value;
+=redis-cljs.helpers/pairs->map= shapes it into a map keyed by the exact field strings.
+An integer above 2^53 arrives as a JavaScript number and loses precision: store such
+values as strings and parse them yourself (=redis-cljs.helpers/big-int= builds a
+BigInt without a literal).
+
+** Promises and channels
+
+Every operation that performs I/O returns a promesa promise built with =p/create=
+around the node-redis promise (=redis-cljs.util/run-op=): a synchronous throw inside
+the library (a bad argument) and a rejection from node-redis arrive at the same
+=p/catch=. Streams are core.async channels: =subscribe!= resolves with a channel of
+pub/sub messages (sliding buffer, 1024 by default, oldest dropped when full) and
+=brpop!= / =blpop!= return a channel fed by repeated blocking pops (a FIXED buffer,
+1024 by default: when it is full the next pop waits for the consumer, so nothing
+popped is dropped). Both buffer sizes are the =:buffer-size= option. A feed ends when
+a pop times out, when =stop-feed!= stops it (no further pop; the pop in flight is
+waited for and its item delivered; then the channel closes) or when the client ends
+(=end!= stops the feeds the same way, and a connection gone for good closes them);
+closing the channel yourself stops it too but loses the item of the pop in flight.
+
+** The configuration translation
+
+node-redis nests the socket options under =socket= and mixes spellings; the library
+keeps one explicit table (=redis-cljs.util/client-config-keys=) from kebab-case
+keyword to the path of the option, and =config->upstream= builds the nested map from
+it. Three things are added: =RESP 2= (node-redis 6 defaults to RESP3, and the
+pub/sub and blocking paths of this library are written for RESP2 replies),
+=maintNotifications "disabled"= (a Redis Enterprise feature that node-redis supports
+under RESP3 only, so it cannot be enabled with this library, and whose handshake
+resolves the host name through DNS), and =reconnectStrategy false= unless =:reconnect=
+says otherwise (node-redis's default retries forever, so a =connect!= to a host that
+does not answer would never settle). An unknown key is refused before anything is
+sent, because node-redis ignores one silently; a configuration without =:url= or
+=:host= is refused too, because node-redis would connect to localhost; so are a blank
+host, a port outside 1..65535, a negative database, a =:url= that is not of the
+=redis://= form or that node-redis cannot parse, and a pool =:minimum= above its
+=:maximum= (upstream would wait forever for clients it never opens).
+
+** The error taxonomy
+
+Every rejection is an =ex-info= whose =:type= is one of four:
+
+- =:redis-cljs/config-error= :: the configuration is not usable: not a map, an
+  unknown key, a value of the wrong shape, neither =:url= nor =:host=, a malformed
+  =:url=, a =REDIS_PORT=, =REDIS_DATABASE= or =REDIS_TLS= that does not parse, a
+  runtime that is not Node.js. Data: =:message :function :argument :expected
+  :received= plus =:unknown :allowed= for an unknown key. =:received= is redacted: the
+  password, the password part of a URL, the TLS key and passphrase read =***=.
+- =:redis-cljs/argument-error= :: an argument of a public function has the wrong
+  shape: a non-client handle, a command that is not a vector or holds a value with
+  no wire representation, a blank channel name, an option of the wrong type or an
+  unknown one. Data: =:message :function :argument :expected :received= plus
+  =:index= for a command argument and =:unknown :allowed= for an option.
+- =:redis-cljs/network-error= :: the connection failed or is gone: refused,
+  =:connect-timeout-ms= elapsed, the socket closed, the client or pool used after
+  =end!=, a wait for a free pooled client that timed out. Data: =:message :cause
+  :op= plus =:code= (the socket error code) and =:name= (the node-redis error class)
+  when present.
+- =:redis-cljs/api-error= :: the server answered a command with an error reply.
+  Data: =:message= (the server's text verbatim), =:code= (its first word:
+  =WRONGTYPE=, =ERR=, =NOAUTH=, =WRONGPASS=, =NOPERM=), =:command= (the vector as
+  sent), =:cause :op=.
+
+Every public function checks its arguments before any I/O: the synchronous functions
+throw, the asynchronous ones reject, and both name the function, the argument and
+what was expected in the message, with the value received in the data (never in the
+message, which may be logged). An =ex-info= thrown by caller code (inside
+=with-client!=, say) passes through untouched.
+
+One reply is a partial success: an =EXEC= whose block had a failed command. Redis
+runs the other commands and answers an array in which the failed ones are error
+replies; node-redis hands the array over with those elements as =ErrorReply= objects.
+=command!= RESOLVES with the vector, each failed element a map ={:error-reply? true
+:message ... :name ...}=, and the failures as metadata on the vector:
+={:redis-cljs/warnings [{:index i :code "WRONGTYPE" :message "..."} ...]}=, read with
+=meta=. Nothing else resolves partially.
+
+** One connection, one thing at a time
+
+node-redis pipelines commands in the order given on one connection and matches
+replies in that order. A blocking pop holds the connection until it answers, and
+every command behind it waits; a subscribed connection serves pub/sub only (the
+server refuses other commands on it under RESP2). Give a feed and a subscriber a
+=connect!= client of their own, or a client lent by =with-client!=, and run the rest
+on another client or on =pool/command!=.
+
+** Secrets
+
+The library reads no file. Credentials come in the configuration map, in a =redis://=
+URL, or through =from-env=, which reads =REDIS_URL=, =REDIS_HOST=, =REDIS_PORT=,
+=REDIS_USERNAME=, =REDIS_PASSWORD=, =REDIS_DATABASE= and =REDIS_TLS= from the
+environment of the process and nothing else, stripping one layer of copy-paste
+quotes from each value (=unwrap-env-value=; a REDIS_TLS value outside the documented
+spellings, and a port or database that is not an integer, are a config-error). A
+handle never prints a password; an error about a configuration carries it redacted
+(=redacted=: the password, the password part of a URL, the TLS key and passphrase
+replaced by =***=) and names no value in its message. Values given in a configuration
+map are never touched.
+
+* Gotchas
+
+Each of these is a behavior of node-redis 6.3.0, of the protocol or of the test
+infrastructure that the library handles or documents as said; "observed" names what
+the suite and the probes of the installed package show. None of them comes from a
+live Redis server: where a server's behavior is asserted, the assertion comes from
+the Redis documentation and is unverified against the live service.
+
+** node-redis 6 speaks RESP3 by default
+
+Observed: with no =RESP= option, the first command of the handshake is =HELLO 3=
+(=@redis/client/dist/lib/RESP/types.js= sets =DEFAULT_RESP = 3=). Under RESP3, pub/sub
+messages are push frames and a hash reply is a map. The library sets =RESP 2= on every
+client and never exposes the key, so every reply shape documented here is the RESP2
+one; a Redis older than 6 answers it, and so does every newer one.
+
+** The default reconnect strategy never gives up
+
+Observed: =connect()= against a port where nothing listens, with node-redis's default
+=reconnectStrategy=, was still retrying after two seconds and five =error= events, and
+never rejected. The library defaults =:reconnect= to =false=: the first failure
+rejects =connect!= with a network-error (=connect ECONNREFUSED ...=), and a
+connection that breaks later stays broken (=status= =:closed=). =:reconnect true= gives
+node-redis's own backoff back; a number is a fixed delay; a function of =[retries
+cause]= returning a delay, =false= or an Error is called at every failure, and
+=connect!= rejects when it gives up (observed: three calls, then rejection).
+
+** An =error= event with no listener
+
+node-redis emits =error= on the client for every socket failure and every retried
+reconnection, and a Node EventEmitter with no =error= listener throws. The library
+attaches one listener per client and per pool that records the event as the
+=last-error= of the handle (a network-error ex-info), so that a connection breaking
+while idle never crashes the process; the next command rejects as it should.
+
+** =close()= waits for the commands in flight
+
+Observed: =client.close()= with a =BRPOP= pending resolves when the fake answers the
+pop, 300 ms later in the probe; the pop resolves with its item. So =end!= of a client
+that runs a blocking feed waits up to the pop's timeout, and a feed with =:timeout-s
+0= holds =end!= until an item arrives. ={:force? true}= destroys the socket at once and
+rejects the pending commands with =Disconnects client= (a network-error). A graceful
+=close()= clears =isOpen= while the socket stays alive to drain, so a client in that
+state reports =:closed= although its commands are still pending; =end!= keeps its own
+=:closing?= and =:ended?= marks and lets a forced =end!= destroy the socket while a
+graceful one is still waiting (upstream's =destroy()= is written for that escalation).
+
+** =end= is not the end
+
+node-redis emits =end= on the client whenever its socket is destroyed, and
+=terminated= when a reconnect strategy gives up (or when there is none). A client
+that reconnects emits =error= and =reconnecting= on the break, then =connect= and
+=ready= on the new socket; the library runs the on-end! hooks (closing the pub/sub
+channels and the pop feeds) on =end= and on =terminated=, once, so a client whose
+strategy gives up after a successful reconnection is cleaned up when upstream stops
+trying. The retry count a strategy receives starts at 0 for every outage.
+
+** A feed abandoned on a lent client keeps popping
+
+A pop feed sends the next =BRPOP= as soon as the channel accepted the previous item.
+A function given a pooled client by =with-client!= that returns while a feed runs
+leaves the feed popping on a client that is no longer its own, and the items go to a
+channel nobody reads: they are removed from Redis and lost. Finish the feed before the
+function resolves (=stop-feed!=, or a =:timeout-s= and the nil that closes the
+channel). The README's pool example pops until the timeout; its queue example stops
+the feed.
+
+** The pool recognizes only a native Promise
+
+Observed: =pool.execute(fn)= returns the client to the idle set at once when =fn=
+returns a promesa promise, because node-redis tests =result instanceof Promise= and a
+promesa promise is a thenable of its own class; the next call then opens a second
+client. The binding wraps the result of =fn= in a native Promise. Observed too: the
+client goes back to the pool in a =finally= that runs after the task's promise
+resolved, so a caller continuing at once would still find the client busy; the
+binding settles the pool's promises one macrotask later (=setImmediate=), after the
+return.
+
+** A loan must not attach listeners
+
+Every client handle attaches =error=, =end= and =terminated= listeners to its
+upstream client. A pool that wrapped a fresh handle at every loan would add three
+listeners per loan and reach Node's =MaxListenersExceededWarning= after ten. The pool
+keeps one handle per upstream client (=:handles= of its state), lends the same one
+every time, and drops it when that client ends.
+
+** The maintenance-notifications handshake resolves the host
+
+Observed: with =maintNotifications= at its default, node-redis sends =CLIENT
+MAINT_NOTIFICATIONS ON moving-endpoint-type ...= in the handshake, and to choose the
+endpoint type it looks the host name up through DNS (an IP literal is not looked up).
+Against OSS Redis the command is answered with an error that node-redis ignores. The
+library defaults =:maint-notifications= to ="disabled"=: no DNS, no extra command.
+
+** =CLIENT SETINFO= is sent on every connection
+
+Observed: node-redis sends =CLIENT SETINFO LIB-VER 6.3.0= and =CLIENT SETINFO LIB-NAME
+node-redis= after =AUTH= / =SELECT= / =CLIENT SETNAME= on every connection, and
+ignores an error reply to them (a Redis older than 7.2 answers one). The fake server
+answers =+OK= and its =commands= reader filters the pair out so that tests read what
+the library sent.
+
+** A pushed message behind Nagle's algorithm
+
+Observed in the fake server: a pub/sub message pushed long after the last reply
+arrives 40 ms late when the server socket has Nagle's algorithm on and the client has
+nothing to send, because the small write waits behind the delayed ACK. The fake sets
+=setNoDelay=; node-redis does the same on its own sockets. A real Redis server
+disables Nagle as well (unverified against the live service).
+
+** BRPOP pops the tail
+
+=RPUSH= appends at the tail and =BRPOP= pops from the tail: a producer that pushes
+=a= then =b= with =RPUSH= and a worker that pops with =BRPOP= gets =b= first. A
+first-in, first-out queue is =RPUSH= with =BLPOP= (or =LPUSH= with =BRPOP=). The
+README's queue examples use =RPUSH= and =blpop!=.
+
+** A subscribed connection under RESP2
+
+Observed with node-redis 6.3.0 and the fake: a =GET= sent on a subscribed connection
+was written to the socket and its reply decoded, node-redis itself does not refuse
+it. Redis does: under RESP2 a client in subscribed mode may only run =SUBSCRIBE=,
+=UNSUBSCRIBE=, =PSUBSCRIBE=, =PUNSUBSCRIBE=, =PING=, =QUIT= and =RESET= (Redis
+documentation of SUBSCRIBE; unverified against the live service). Subscribe on a
+client of its own.
+
+** Integer replies above 2^53
+
+node-redis decodes a RESP2 integer into a JavaScript number; a value above 2^53
+loses precision. Unverified against the live service with such a value; store large
+integers as strings and parse them yourself.
+
+* Testing
+
+=./run-tests.sh= runs the publicity gate (=test/publicity_gate.sh=: =src/=,
+=README.md= and =docs/= carry no development-process narrative, no machine paths,
+no dated stamps, no secrets), then compiles the =node-test= build with autorun off and
+runs =node target/node-test.js= itself, so the exit status is real.
+
+The suite is offline beyond the loopback interface. =test/redis_cljs/fake_server.cljs=
+is a =net.Server= on a free port of 127.0.0.1 that speaks RESP2: it parses the arrays
+of bulk strings (and inline commands) the real node-redis client sends, records every
+request, and answers from a script keyed by command name, with built-in answers for
+the handshake (=AUTH=, =SELECT=, =CLIENT=, =HELLO=, =PING=, =ECHO=, =QUIT=) and for
+pub/sub (=SUBSCRIBE= / =UNSUBSCRIBE= confirmations, =PUBLISH= pushed to the
+subscribed connections and answered with their count). A script entry is a reply (a
+string, a Buffer, an integer, nil, a vector, =(simple "OK")=, =(error "WRONGTYPE
+...")=, =(delayed ms reply)=, =(close-connection)=) or a function of the request
+(=in-order= answers a sequence of replies), and =reply-next!= overrides the next
+reply of a command for one test. An unscripted command is answered =-ERR unscripted
+command=, so a test cannot pass on an accidental default. The one socket the suite
+opens elsewhere goes to a port of 127.0.0.1 that the fake bound and released
+(=closed-port=), to prove a refused connection is reported; the test of =from-env=
+clears every =REDIS_*= variable of the process for its duration and puts them back.
+The suite assumes nothing else of the machine than a loopback interface and free
+ephemeral ports.
+
+What is covered: the translation tables, validation, redaction and the environment
+parsing (=util_test=); connect from the host/port and URL forms, a refused
+configuration with no socket opened and no secret in the error, a refused connection,
+a refused handshake, a reconnect strategy that gives up at once and one that gives up
+after a reconnection, =from-env=, every command family round-tripping as data with
+the request read back verbatim, Buffers in and out, error replies verbatim, a mixed
+EXEC reply with its warnings, expiry as the server reports it, delayed replies, the
+pop feeds (items in order, nil on timeout, =stop-feed!= losing nothing, Buffers for
+key and value, error, after end), =end!= graceful, forced, and forced while a
+graceful one waits, a broken connection recorded and every channel closed, the
+argument contract of every function with option values checked (=core_test=);
+pub/sub across two connections, several channels, Buffers and the sliding buffer,
+closing a channel yourself, a refused SUBSCRIBE, the message argument (=pubsub_test=);
+pools, lending the same handle without listeners added, counters, the acquire
+timeout, =:minimum= above =:maximum=, after end (=pool_test=); the helpers
+(=helpers_test=); the examples of the README with the README held to them character
+for character, extra code blocks refused (=examples_test=); and this manual's API
+reference held to the public vars of the source in both directions
+(=api_index_test=).
+
+** Break-the-gate evidence
+
+A suite is trusted once it has been seen failing. The check: one line of the fake
+server, the RESP2 encoding of an integer reply, changed from =(crlf ":" reply)= to
+=(crlf ":" (inc reply))=, so every integer the fake answers is off by one; then
+=./run-tests.sh=; then the line put back and =./run-tests.sh= again. The captured
+output of the broken run (exit status 1):
+
+#+begin_example
+FAIL in (commands-round-trip-as-data) (redis_cljs/core_test.cljs:295:21)
+replies are what the server sent: strings, numbers, nil, vectors
+expected: (= 1 setnx)
+  actual: (not (= 1 2))
+...
+FAIL in (commands-round-trip-as-data) (redis_cljs/core_test.cljs:299:21)
+replies are what the server sent: strings, numbers, nil, vectors
+expected: (= 42 incr)
+  actual: (not (= 42 43))
+...
+Ran 84 tests containing 989 assertions.
+38 failures, 0 errors.
+#+end_example
+
+And of the run after the revert (exit status 0):
+
+#+begin_example
+Ran 84 tests containing 989 assertions.
+0 failures, 0 errors.
+#+end_example
+
+The line numbers are those of the suite at the time of the check; the counts are what
+=./run-tests.sh= printed.
+
+* API reference
+
+Every public var of every namespace, with the exact shape of what it returns. An
+asynchronous function returns a promesa promise; "resolves with" names what the
+promise carries, "rejects with" the =:type= of the ex-info. A synchronous function
+"returns" its value or "throws" an argument-error.
+
+** redis-cljs.core
+
+**** redis-cljs.core/api-version
+The library's own version marker, the string ="0.1.0"=; not the node-redis version.
+
+**** redis-cljs.core/default-buffer-size
+=1024=: the fixed-buffer size of a blocking-pop channel when =:buffer-size= is absent.
+
+**** redis-cljs.core/client?
+=(client? x)= returns =true= for a client handle (of =connect!= or lent by
+=with-client!=), =false= otherwise. Never throws.
+
+**** redis-cljs.core/status
+=(status client)= returns =:ready=, =:connecting= or =:closed=, read live off
+node-redis's flags. Throws an argument-error for a non-client.
+
+**** redis-cljs.core/check-client!
+=(check-client! function x)= returns =x= when it is a client handle, throws an
+argument-error naming =function= (a symbol) and =:client= otherwise. Shared with the
+pool and pubsub namespaces.
+
+**** redis-cljs.core/last-error
+=(last-error client)= returns the last =error= event of the client as a
+=:redis-cljs/network-error= ex-info (its =:cause= the node-redis error), or nil.
+Throws an argument-error for a non-client.
+
+**** redis-cljs.core/on-end!
+=(on-end! client f)= registers =f=, a function of no arguments, to run once when the
+connection ends; returns nil. Throws an argument-error for a non-client or a
+non-function.
+
+**** redis-cljs.core/wrap-client
+=(wrap-client js-client pooled?)= returns a client handle around a node-redis client
+object with the =error=, =end= and =terminated= listeners attached. Used by =connect!=
+and the pool, once per upstream client; callers never need it. Throws an
+argument-error for a non-object or a non-boolean.
+
+**** redis-cljs.core/from-env
+=(from-env)= returns the configuration map read from =REDIS_URL=, =REDIS_HOST=,
+=REDIS_PORT=, =REDIS_USERNAME=, =REDIS_PASSWORD=, =REDIS_DATABASE= and =REDIS_TLS=
+(=:url :host :port :username :password :database :tls=, the port and database as
+integers, =:tls= as a boolean), ={}= when nothing is set. Throws a config-error for a
+port or database that is not an integer and for a =REDIS_TLS= outside its spellings.
+
+**** redis-cljs.core/connect!
+=(connect! config)= resolves with a client handle once the handshake is done.
+=config= is a map of =redis-cljs.util/client-config-keys= or =(from-env)=. Rejects
+with =:redis-cljs/config-error= (not a map, an unknown key, a wrong value, neither
+=:url= nor =:host=, a malformed =:url=), =:redis-cljs/network-error= (refused, timed
+out, closed during the handshake) or =:redis-cljs/api-error= (the handshake refused:
+=WRONGPASS=, =NOAUTH=, a database out of range).
+
+**** redis-cljs.core/command!
+=(command! client cmd)= and =(command! client cmd opts)= resolve with the reply of the
+command: a string, a number, nil, a Buffer (with ={:buffers? true}=) or a vector of
+these; a vector with error elements (an EXEC with a failed command) carries
+=:redis-cljs/warnings= metadata. Rejects with =:redis-cljs/argument-error= (a
+non-client, a command that is not a vector, has a blank name or holds a nil /
+boolean / collection / function, a non-boolean or unknown option),
+=:redis-cljs/api-error= (an error reply: =:message= verbatim, =:code=, =:command=) or
+=:redis-cljs/network-error= (the connection gone).
+
+**** redis-cljs.core/pop-options
+The map of the options =brpop!= and =blpop!= accept (=:timeout-s=, =:buffer-size=,
+=:buffers?=) to the predicate each value must satisfy.
+
+**** redis-cljs.core/brpop!
+=(brpop! client keys)= and =(brpop! client keys opts)= return, synchronously, a
+core.async channel fed by =BRPOP= on =keys= (a key name or a vector of names): each
+item arrives as ={:key "queue" :value "item"}= (both Buffers with =:buffers?=), the
+channel closes when a pop times out (=:timeout-s=, default 0 = never), when
+=stop-feed!= stops the feed, when the client ends, or when the consumer closes it, and
+an error arrives as ={:error e}= before the channel closes. The buffer is FIXED,
+=:buffer-size= (default 1024): when it is full the next pop waits for the consumer.
+Throws an argument-error for a non-client, bad keys, a negative =:timeout-s=, a
+non-positive =:buffer-size=, a non-boolean =:buffers?= or an unknown option.
+
+**** redis-cljs.core/blpop!
+=(blpop! client keys)= and =(blpop! client keys opts)=: =brpop!= with =BLPOP=, the same
+channel, options and errors.
+
+**** redis-cljs.core/stop-feed!
+=(stop-feed! client ch)= stops the feed of =ch= (a channel =brpop!= or =blpop!=
+returned for =client=): no further pop is sent, the pop in flight is waited for and
+its item delivered, then the channel is closed; resolves with nil once the channel is
+closed (nil at once for a feed already finished). Rejects with an argument-error for
+a non-client or a channel that is not a feed of this client.
+
+**** redis-cljs.core/feeds
+=(feeds client)= returns the set of the client's live pop channels. Throws an
+argument-error for a non-client.
+
+**** redis-cljs.core/end-options
+The map of the options =end!= accepts (=:force?=) to the predicate its value must
+satisfy.
+
+**** redis-cljs.core/end!
+=(end! client)= and =(end! client opts)= resolve with nil once the socket is closed:
+the pop feeds are stopped, the commands in flight are waited for, or cut with
+={:force? true}= (they reject with =Disconnects client=; a forced =end!= also cuts a
+graceful one still waiting), and every channel of the client is closed once the
+connection ended. A second graceful =end!= resolves nil at once. Rejects with an
+argument-error for a non-client, a non-boolean or unknown option, or a client lent
+by a pool.
+
+** redis-cljs.pool
+
+**** redis-cljs.pool/pool?
+=(pool? x)= returns =true= for a pool handle, =false= otherwise.
+
+**** redis-cljs.pool/check-pool!
+=(check-pool! function x)= returns =x= when it is a pool handle, throws an
+argument-error naming =function= and =:pool= otherwise.
+
+**** redis-cljs.pool/status
+=(status pool)= returns ={:total-clients n :idle-clients n :waiting-tasks n :open?
+b :closing? b :minimum n :maximum n}=, the counters read live. Throws an
+argument-error for a non-pool.
+
+**** redis-cljs.pool/last-error
+=(last-error pool)= returns the last =error= event of the pool as a
+=:redis-cljs/network-error= ex-info, or nil. Throws an argument-error for a non-pool.
+
+**** redis-cljs.pool/pool!
+=(pool! config)= returns a pool handle at once, without connecting; =config= is a map
+of =redis-cljs.util/pool-config-keys= (every client key plus =:minimum :maximum
+:acquire-timeout-ms :cleanup-delay-ms=) or =(from-env)=. Throws a config-error for an
+unknown key, a wrong value, =:minimum= above =:maximum= or neither =:url= nor =:host=.
+
+**** redis-cljs.pool/connect!
+=(connect! pool)= resolves with the pool handle once =:minimum= clients are ready.
+Rejects as =redis-cljs.core/connect!= does, or with an argument-error for a non-pool.
+
+**** redis-cljs.pool/command!
+=(command! pool cmd)= and =(command! pool cmd opts)= resolve with the reply of the
+command run on a free client, as =redis-cljs.core/command!= does, once the client is
+back in the pool. Rejects as =redis-cljs.core/command!= does, plus
+=:redis-cljs/network-error= when no client could be obtained in =:acquire-timeout-ms=
+or the pool has been ended.
+
+**** redis-cljs.pool/with-client!
+=(with-client! pool f)= resolves with what =f=, a function of a lent client handle
+returning a promise or a value, resolved with, once the client is back in the pool;
+the handle is the one the pool keeps for that upstream client. A feed started on the
+lent client must be finished before =f= resolves. Rejects with what =f= rejected or
+threw (an ex-info of caller code untouched), with an argument-error for a non-pool or
+a non-function, and with =:redis-cljs/network-error= when no client could be obtained
+or the pool has been ended.
+
+**** redis-cljs.pool/end!
+=(end! pool)= resolves with nil once every client is closed (a lent client once
+returned). A second =end!= resolves nil at once. Rejects with an argument-error for a
+non-pool.
+
+**** redis-cljs.pool/pool-connect!
+The same function as =connect!=: =(pool-connect! pool)= resolves with the pool handle
+once its first =:minimum= clients are ready, and rejects as =connect!= does.
+
+**** redis-cljs.pool/pool-command!
+The same function as =command!=: =(pool-command! pool cmd)= and =(pool-command! pool
+cmd opts)= resolve with the reply (a string, a number, nil, a Buffer, or a vector of
+these) and reject as =command!= does.
+
+**** redis-cljs.pool/pool-end!
+The same function as =end!=: =(pool-end! pool)= resolves with nil once every client is
+closed, and rejects as =end!= does.
+
+**** redis-cljs.pool/pool-status
+The same function as =status=: =(pool-status pool)= returns ={:total-clients
+:idle-clients :waiting-tasks :open? :closing? :minimum :maximum}= and throws as
+=status= does.
+
+** redis-cljs.pubsub
+
+**** redis-cljs.pubsub/default-buffer-size
+=1024=: the sliding-buffer size of a subscription channel when =:buffer-size= is
+absent.
+
+**** redis-cljs.pubsub/subscribe-options
+The map of the options =subscribe!= accepts (=:buffer-size=, =:buffers?=) to the
+predicate each value must satisfy.
+
+**** redis-cljs.pubsub/subscribe!
+=(subscribe! client channel-name)= and =(subscribe! client channel-name opts)=
+resolve, once the server confirmed, with a core.async channel of
+={:channel "name" :message "..."}= maps (Buffers with =:buffers?=), sliding buffer of
+=:buffer-size= (default 1024, the oldest dropped when full). The channel closes on
+=unsubscribe!= and when the connection ends; closed by the consumer, its listener is
+detached at the next message and UNSUBSCRIBE sent when it was the last one. Rejects
+with an argument-error (a non-client, a blank name, an option of the wrong type or an
+unknown one), =:redis-cljs/api-error= (the server refused) or
+=:redis-cljs/network-error=.
+
+**** redis-cljs.pubsub/unsubscribe!
+=(unsubscribe! client channel-name)= closes every channel of that name on the client
+and resolves with nil once the server confirmed the =UNSUBSCRIBE=. Rejects with an
+argument-error for a non-client or a blank name, and as =subscribe!= does otherwise.
+
+**** redis-cljs.pubsub/subscribed
+=(subscribed client)= returns the set of channel names with open =subscribe!=
+channels on the client. Throws an argument-error for a non-client.
+
+**** redis-cljs.pubsub/publish!
+=(publish! client channel-name message)= resolves with the number of subscribers that
+received the message (an integer). Rejects with an argument-error for a non-client, a
+blank name or a message that is not a string, Buffer or number, and as =command!=
+does otherwise.
+
+** redis-cljs.helpers
+
+**** redis-cljs.helpers/pairs->map
+=(pairs->map pairs)= returns a map of field -> value from a flat vector of alternating
+fields and values (=HGETALL=), ={}= for nil. Throws an argument-error for an odd length
+or a non-vector.
+
+**** redis-cljs.helpers/map->pairs
+=(map->pairs m)= returns the flat vector of fields and values =HSET= / =MSET= take
+from a map with string keys. Throws an argument-error for a non-map or a non-string
+key.
+
+**** redis-cljs.helpers/pop-reply
+=(pop-reply reply)= returns ={:key k :value v}= from a =["key" "value"]= reply, nil
+for nil. Throws an argument-error for anything else.
+
+**** redis-cljs.helpers/scan-reply
+=(scan-reply reply)= returns ={:cursor "17" :items [...]}= from a =["17" [...]]=
+reply. Throws an argument-error for anything else.
+
+**** redis-cljs.helpers/ok?
+=(ok? reply)= returns =true= when =reply= is ="OK"=, =false= otherwise.
+
+**** redis-cljs.helpers/big-int
+=(big-int x)= returns a JavaScript BigInt for a string of decimal digits (optional
+leading minus) or an integer number. Throws an argument-error for anything else.
+
+** redis-cljs.util
+
+**** redis-cljs.util/client-config-keys
+The map of every =connect!= key to the path of the node-redis option it becomes.
+
+**** redis-cljs.util/tls-option-keys
+The map of every =:tls-options= key to the Node =tls.connect= option it becomes.
+
+**** redis-cljs.util/pool-only-keys
+The map of the four pool keys to the node-redis pool option each becomes.
+
+**** redis-cljs.util/pool-config-keys
+=client-config-keys= merged with =pool-only-keys=.
+
+**** redis-cljs.util/fixed-upstream-options
+={"RESP" 2 "maintNotifications" "disabled"}=: what every client gets and no key
+exposes.
+
+**** redis-cljs.util/default-config
+={:reconnect false}=: the default the library sets differently from node-redis; an
+explicit key overrides it.
+
+**** redis-cljs.util/env-keys
+The map of the seven =REDIS_*= variable names to the configuration key each fills.
+
+**** redis-cljs.util/env-booleans
+The map of the spellings =REDIS_TLS= accepts (=1 true yes on=, =0 false no off=,
+case-insensitively) to the boolean each means.
+
+**** redis-cljs.util/url-pattern
+The regular expression a =:url= must match: =redis://= or =rediss://= followed by
+non-blank characters.
+
+**** redis-cljs.util/error-types
+The set of the four =:type= values a redis-cljs ex-info can carry.
+
+**** redis-cljs.util/config-error
+=(config-error function argument expected received)= and =(config-error function
+argument expected received more)= return an ex-info of =:type=
+=:redis-cljs/config-error= whose data names =:function :argument :expected
+:received= and merges =more=; the message names no value.
+
+**** redis-cljs.util/argument-error
+=(argument-error function argument expected received)= and =(argument-error function
+argument expected received more)= return an ex-info of =:type=
+=:redis-cljs/argument-error= whose data names =:function :argument :expected
+:received= and merges =more=.
+
+**** redis-cljs.util/network-error
+=(network-error message data)= returns an ex-info of =:type=
+=:redis-cljs/network-error=.
+
+**** redis-cljs.util/api-error
+=(api-error message data)= returns an ex-info of =:type= =:redis-cljs/api-error=.
+
+**** redis-cljs.util/error-data
+=(error-data e)= returns the ex-data of a redis-cljs error, nil for anything else.
+
+**** redis-cljs.util/error-type
+=(error-type e)= returns the =:type= of a redis-cljs error, nil for anything else.
+
+**** redis-cljs.util/check!
+=(check! function argument pred expected received)= returns =received= when =(pred
+received)=, throws an argument-error otherwise. The validator every public function
+runs.
+
+**** redis-cljs.util/connect-config
+=(connect-config x)= returns the map behind a =connect!= argument: nil -> ={}=, a map
+-> itself. Throws a config-error for anything else, a bare URL string included.
+
+**** redis-cljs.util/pool-config
+=(pool-config x)= returns the map behind a =pool!= argument, the same two forms.
+
+**** redis-cljs.util/normalize-config
+=(normalize-config config)= returns the map without its nil-valued entries, with
+=default-config= filled in for the keys absent.
+
+**** redis-cljs.util/check-config!
+=(check-config! config)= returns =config= when every key is a client key, every
+value has the right shape and =:url= or =:host= is present; throws a config-error
+(its =:received= redacted) otherwise.
+
+**** redis-cljs.util/check-pool-config!
+=(check-pool-config! config)= returns =config= under the same rules with the pool
+keys allowed and checked, =:minimum= not above =:maximum=.
+
+**** redis-cljs.util/config->upstream
+=(config->upstream config)= returns the nested map keyed by node-redis's option
+names, with =RESP 2= and =maintNotifications "disabled"= added. Throws an
+argument-error for a key outside =pool-config-keys=.
+
+**** redis-cljs.util/pool-config->upstream
+=(pool-config->upstream config)= returns =[client-options pool-options]=.
+
+**** redis-cljs.util/redacted
+=(redacted config)= returns the configuration with =:password= replaced by ="***"=,
+the password part of a =:url= hidden, and =:key= and =:passphrase= of =:tls-options=
+replaced by ="***"=; a bare URL string with its password hidden; anything else as it
+is.
+
+**** redis-cljs.util/unwrap-env-value
+=(unwrap-env-value v)= returns the string trimmed and stripped of one layer of
+matching quotes (double, single or back), nil for a blank or non-string input or a
+quoted empty string.
+
+**** redis-cljs.util/parse-integer
+=(parse-integer s)= returns the non-negative integer a string of decimal digits
+writes, nil for anything else.
+
+**** redis-cljs.util/env->config
+=(env->config env)= returns the configuration map read from a map of variable name
+-> string through =env-keys=; throws a config-error for a port or database that is
+not an integer and for a =REDIS_TLS= outside =env-booleans=.
+
+**** redis-cljs.util/command-function
+The symbol =redis-cljs.core/command!=, which the argument errors of a command vector
+name by default.
+
+**** redis-cljs.util/check-command!
+=(check-command! cmd)= and =(check-command! function cmd)= return =cmd= when it is a
+non-empty vector whose first element is a keyword, string or symbol; throw an
+argument-error otherwise.
+
+**** redis-cljs.util/command->upstream
+=(command->upstream cmd)=, =(command->upstream function cmd)= and
+=(command->upstream function cmd wire-object?)= return the vector of arguments
+node-redis sends: the name upper-cased and split into words, strings as they are,
+keywords upper-cased, numbers as decimal text, and the objects =wire-object?= accepts
+(the core passes the binding's test for Buffers and BigInts; none by default) as they
+are. Throw an argument-error (with =:index=) for any other argument.
+
+**** redis-cljs.util/command-options
+The map of the options =command!= accepts (=:buffers?=) to the predicate its value
+must satisfy.
+
+**** redis-cljs.util/check-options!
+=(check-options! function allowed opts)= returns =opts= when nil or a map whose keys
+are in =allowed= (a map of option to predicate) with every value accepted by its
+predicate; throws an argument-error naming the option otherwise.
+
+**** redis-cljs.util/check-command-options!
+=(check-command-options! opts)= is =check-options!= for =command!=.
+
+**** redis-cljs.util/keys-argument
+=(keys-argument function keys)= returns the vector of key names behind a string or a
+vector of non-blank strings; throws an argument-error otherwise.
+
+**** redis-cljs.util/error-reply-code
+=(error-reply-code message)= returns the first word of an error reply.
+
+**** redis-cljs.util/failure-kind
+=(failure-kind info)= returns =:api= when =info= says the error is a server reply,
+=:network= otherwise.
+
+**** redis-cljs.util/passthrough-error?
+=(passthrough-error? e)= returns =true= for a redis-cljs error or any ex-info.
+
+**** redis-cljs.util/normalize-failure
+=(normalize-failure op info-of e)= and =(normalize-failure op info-of e extra)=
+return the ex-info for a rejection: a passthrough error as it is, otherwise an
+api-error or a network-error built from the facts =info-of= reads.
+
+**** redis-cljs.util/warnings-of
+=(warnings-of error-element? v)= returns the =:redis-cljs/warnings= of a reply vector
+with error elements (one ={:index :code :message}= per element =error-element?=
+accepts, in order), nil when none.
+
+**** redis-cljs.util/run-op
+=(run-op normalize f)= returns a promesa promise settled with the outcome of =(f)=,
+every rejection passed through =normalize=.
+
+** redis-cljs.binding
+
+Internal. The one namespace that touches JavaScript: it requires the =redis= module,
+builds the options and argument objects, calls =createClient=, =connect=,
+=sendCommand=, =subscribe=, =unsubscribe=, =close=, =destroy=, =createClientPool=,
+=execute=, reads the flags, counters and errors, and converts replies to data. Its
+functions return node-redis's own values (native promises, JavaScript objects and
+errors) and validate nothing but what the namespaces above cannot (=->bigint= refuses
+a string that is not an integer); they are not part of the documented surface and may
+change with node-redis. The namespaces above are the API.
