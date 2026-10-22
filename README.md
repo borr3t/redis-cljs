@@ -509,7 +509,9 @@ network-error is the socket error code when there is one.
   events are recorded on the handle instead of thrown, and every channel of a client
   closes when its connection is gone for good.
 * **No interop at call sites** — the public namespaces carry no `^js` hints;
-  JavaScript lives in one internal binding namespace, `redis-cljs.binding`.
+  JavaScript lives in one internal binding namespace, `redis-cljs.binding`, with one
+  exception: `util/parse-url` percent-decodes the credentials of a URL with
+  `js/decodeURIComponent`, as node-redis itself does.
 
 ## Limits and settings
 
@@ -643,9 +645,11 @@ docs/
   `check-pool-config!`, `check-command!`, `check-command-options!`, `check-options!`,
   `check!`, `keys-argument`, and the plumbing `failure-kind`, `passthrough-error?`,
   `normalize-failure`, `run-op`.
-* `redis-cljs.binding` is internal: the one namespace that touches JavaScript. Its
-  functions return native promises and JavaScript objects and are not part of the
-  documented surface.
+* `redis-cljs.binding` is internal: the one namespace that touches JavaScript (the
+  one call outside it is `js/decodeURIComponent` in `util/parse-url`, the
+  percent-decoding node-redis itself applies to URL credentials). Its functions
+  return native promises and JavaScript objects and are not part of the documented
+  surface.
 
 ## Development
 

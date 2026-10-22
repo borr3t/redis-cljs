@@ -831,7 +831,9 @@ every rejection passed through =normalize=.
 
 ** redis-cljs.binding
 
-Internal. The one namespace that touches JavaScript: it requires the =redis= module,
+Internal. The one namespace that touches JavaScript, save for the
+=js/decodeURIComponent= of =util/parse-url= (the percent-decoding node-redis itself
+applies to the credentials of a URL): it requires the =redis= module,
 builds the options and argument objects, calls =createClient=, =connect=,
 =sendCommand=, =subscribe=, =unsubscribe=, =close=, =destroy=, =createClientPool=,
 =execute=, reads the flags, counters and errors, and converts replies to data. Its
