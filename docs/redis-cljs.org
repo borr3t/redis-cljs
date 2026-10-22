@@ -371,24 +371,24 @@ server, the RESP2 encoding of an integer reply, changed from =(crlf ":" reply)= 
 output of the broken run (exit status 1):
 
 #+begin_example
-FAIL in (commands-round-trip-as-data) (redis_cljs/core_test.cljs:305:21)
+FAIL in (commands-round-trip-as-data) (redis_cljs/core_test.cljs:312:21)
 replies are what the server sent: strings, numbers, nil, vectors
 expected: (= 1 setnx)
   actual: (not (= 1 2))
 ...
-FAIL in (commands-round-trip-as-data) (redis_cljs/core_test.cljs:309:21)
+FAIL in (commands-round-trip-as-data) (redis_cljs/core_test.cljs:316:21)
 replies are what the server sent: strings, numbers, nil, vectors
 expected: (= 42 incr)
   actual: (not (= 42 43))
 ...
-Ran 92 tests containing 1182 assertions.
+Ran 92 tests containing 1234 assertions.
 38 failures, 0 errors.
 #+end_example
 
 And of the run after the revert (exit status 0):
 
 #+begin_example
-Ran 92 tests containing 1182 assertions.
+Ran 92 tests containing 1234 assertions.
 0 failures, 0 errors.
 #+end_example
 
@@ -743,10 +743,12 @@ itself; only the error's =:received= is redacted).
 =(redacted config)= returns the configuration with =:password= replaced by ="***"=,
 the password part of a =:url= hidden (from the first colon of the credentials to the
 last =@= before the path, so a password holding =@= is masked whole and a username
-holding =@= leaves the mask in place), =:key= and =:passphrase= of =:tls-options=
-replaced by ="***"=, and
+holding =@= leaves the mask in place; a =:url= with an =@= past the first =/=, =?= or
+=#=, as a raw one of those in a password puts it, has no certain end to its
+credentials and shows nothing after its scheme: ="redis://***"=), =:key= and
+=:passphrase= of =:tls-options= replaced by ="***"=, and
 a =:url= or =:tls-options= of another type masked whole; a bare URL string with its
-password hidden; anything else as it is.
+password hidden the same way; anything else as it is.
 
 **** redis-cljs.util/unwrap-env-value
 =(unwrap-env-value v)= returns the string trimmed and stripped of one layer of

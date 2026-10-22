@@ -172,7 +172,9 @@
                     negative-url-db (failure (core/connect! {:url "redis://127.0.0.1/-1"}))
                     fractional-db (failure (core/connect! {:url "redis://127.0.0.1/1.5"}))
                     tls-mismatch (failure (core/connect! {:url (fake/url server) :tls true}))
-                    secret (failure (core/connect! (fake/config server {:password {:token "SYNTHETIC_SECRET"}})))]
+                    secret (failure (core/connect! (fake/config server {:password {:token "SYNTHETIC_SECRET"}})))
+                    split-query (failure (core/connect! {:url "redis://u:SYNTHETIC?SECRET@127.0.0.1"}))
+                    split-fragment (failure (core/connect! {:url "redis://u:SYNTHETIC#SECRET@127.0.0.1"}))]
               (is (= :redis-cljs/config-error (:type unknown)))
               (is (= #{:timeout} (:unknown unknown)))
               (is (= :redis-cljs/config-error (:type no-host)))
@@ -193,6 +195,11 @@
               (is (= "***" (:received secret)))
               (is (not (str/includes? (pr-str secret) "SYNTHETIC_SECRET")))
               (is (not (str/includes? (:message secret) "SYNTHETIC_SECRET")))
+              (doseq [d [split-query split-fragment]]
+                (is (= :url (:argument d)) "a raw ? or # in the password splits the URL: refused")
+                (is (= "redis://***" (:received d)) "nothing after the scheme is carried")
+                (is (not (str/includes? (pr-str d) "SYNTHETIC")))
+                (is (not (str/includes? (:message d) "SYNTHETIC"))))
               (is (= [] (fake/received server)))
               (is (= 0 (fake/connections server)) "nothing was opened"))))))))
 

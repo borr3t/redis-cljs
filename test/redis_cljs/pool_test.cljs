@@ -88,6 +88,15 @@
         (is (= argument (:argument d)) (pr-str config))
         (is (not (str/includes? (pr-str d) "SYNTHETIC_SECRET")) (pr-str config))
         (is (not (str/includes? m "SYNTHETIC_SECRET")) (pr-str config)))))
+  (testing "a URL split by a raw ?, # or / in its password: refused, nothing after the scheme carried"
+    (doseq [config [{:url "redis://u:SYNTHETIC?SECRET@h"}
+                    {:url "redis://u:SYNTHETIC#SECRET@h"}]]
+      (let [d (thrown-data #(pool/pool! config))
+            m (try (pool/pool! config) nil (catch :default e (ex-message e)))]
+        (is (= :url (:argument d)) (pr-str config))
+        (is (= "redis://***" (:received d)) (pr-str config))
+        (is (not (str/includes? (pr-str d) "SYNTHETIC")) (pr-str config))
+        (is (not (str/includes? m "SYNTHETIC")) (pr-str config)))))
   (is (= :redis-cljs/config-error (:type (thrown-data #(pool/pool! 42))))))
 
 (deftest a-url-pool-prints-without-its-password

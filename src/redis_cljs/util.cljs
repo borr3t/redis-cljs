@@ -245,11 +245,30 @@
 ;; ---------------------------------------------------------------------------
 
 (def ^:private url-credentials-pattern
-  "The credentials of a URL: everything between :// and the LAST @ before
-   the path, so a username or a password holding @ itself is read whole
-   (node-redis reads the authority the same way: the last @ ends the
-   credentials)."
+  "The credentials of a URL: everything between :// and the LAST @ of the
+   authority, the part before the first /, ? or # (node-redis reads the
+   authority the same way: the last @ ends the credentials, so a username
+   or a password holding @ is read whole)."
   #"://([^/?#]*)@")
+
+(def ^:private url-scheme-pattern
+  "The scheme of a URL with its separator, redis:// or rediss://."
+  #"^[^:/?#]*://")
+
+(def ^:private stray-at-pattern
+  "What follows the scheme when an @ sits PAST the authority: after the
+   first /, ? or #. Such a string is no URL node-redis reads credentials
+   from, yet a password written with a raw /, ? or # in it ends the
+   authority early and puts its @ exactly here: where the credentials
+   end is unknown, so nothing after the scheme is shown."
+  #"^[^/?#]*[/?#][\s\S]*@")
+
+(defn- stray-at?
+  "Whether `url` holds an @ past its authority (see stray-at-pattern); the
+   scheme, when there is one, is skipped first."
+  [url]
+  (let [scheme (or (re-find url-scheme-pattern url) "")]
+    (boolean (re-find stray-at-pattern (subs url (count scheme))))))
 
 (defn- masked-credentials
   "The credentials of a URL with their password part masked: what follows
@@ -261,13 +280,18 @@
     credentials))
 
 (defn- redact-url
-  "A URL string with its password masked; anything that is not a string
-   masked whole (an invalid :url value may still hold a secret)."
+  "A URL string with its password masked, the whole of what follows the
+   scheme masked when an @ sits past the authority (where the credentials
+   would end is then unknown: redis://u:pass?word@h shows as
+   redis://***, a string with no scheme as ***), and anything that is not
+   a string masked whole (an invalid :url value may still hold a secret).
+   A string without @ holds no credentials under any reading and is kept."
   [url]
-  (if (string? url)
-    (str/replace url url-credentials-pattern
-                 (fn [[_ credentials]] (str "://" (masked-credentials credentials) "@")))
-    "***"))
+  (cond
+    (not (string? url)) "***"
+    (stray-at? url) (str (re-find url-scheme-pattern url) "***")
+    :else (str/replace url url-credentials-pattern
+                       (fn [[_ credentials]] (str "://" (masked-credentials credentials) "@")))))
 
 (defn- redact-tls-options
   "A :tls-options map with :key and :passphrase masked; anything that is
@@ -281,9 +305,11 @@
 
 (defn redacted
   "The configuration without its secrets: :password replaced by \"***\",
-   the password part of a :url hidden, and :key and :passphrase of
-   :tls-options replaced by \"***\" (a :url or :tls-options of another type
-   masked whole), and the password part of a bare URL string hidden.
+   the password part of a :url hidden (everything after the scheme when
+   an @ past the first /, ? or # leaves the credentials without a certain
+   end), and :key and :passphrase of :tls-options replaced by \"***\" (a
+   :url or :tls-options of another type masked whole), and the password
+   part of a bare URL string hidden the same way.
    Applied wherever a configuration is printed (a handle) or carried in
    an error. Anything else is returned as it is."
   [config]

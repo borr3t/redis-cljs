@@ -111,7 +111,21 @@
         (is (not (str/includes? m "SYNTHETIC_SECRET")) (pr-str config)))))
   (testing "a non-map configuration holding a secret is redacted too"
     (is (not (str/includes? (pr-str (thrown-data #(util/connect-config "redis://u:SYNTHETIC_SECRET@h")))
-                            "SYNTHETIC_SECRET")))))
+                            "SYNTHETIC_SECRET"))))
+  (testing "a password written with a raw ?, # or / splits the URL: it is refused and nothing after the scheme is carried"
+    (doseq [config [{:url "redis://u:SYNTHETIC?SECRET@h"}
+                    {:url "redis://u:SYNTHETIC#SECRET@h"}
+                    {:url "redis://u:SYNTHETIC/SECRET@h"}
+                    {:url "rediss://u:SYNTHETIC?SE@CRET@h:6380/0"}]]
+      (let [d (thrown-data #(util/check-config! (util/normalize-config config)))
+            m (thrown-message #(util/check-config! (util/normalize-config config)))]
+        (is (= :url (:argument d)) (pr-str config))
+        (is (= (str (subs (:url config) 0 (+ 3 (str/index-of (:url config) "://"))) "***") (:received d)) (pr-str config))
+        (is (not (str/includes? (pr-str d) "SYNTHETIC")) (pr-str config))
+        (is (not (str/includes? m "SYNTHETIC")) (pr-str config))))
+    (let [d (thrown-data #(util/connect-config "u:SYNTHETIC?SECRET@h"))]
+      (is (= "***" (:received d)) "no scheme, nothing to show")
+      (is (not (str/includes? (pr-str d) "SYNTHETIC"))))))
 
 (deftest urls-are-parsed-and-checked-like-the-explicit-keys
   (testing "parse-url"
@@ -207,6 +221,8 @@
   (testing "the check runs on the configuration itself: a secret of the wrong shape and a pool key out of range are refused, the error redacted"
     (doseq [config [{:host "h" :password 7}
                     {:url "redis://u:SYNTHETIC SECRET@h"}
+                    {:url "redis://u:SYNTHETIC?SECRET@h"}
+                    {:url "redis://u:SYNTHETIC#SECRET@h"}
                     {:host "h" :minimum 0}
                     {:host "h" :minimum 3 :maximum 1}
                     {:host "h" :acquire-timeout-ms -1}]]
@@ -216,7 +232,9 @@
         (is (not (str/includes? (pr-str d) "SYNTHETIC")) (pr-str config))
         (is (not (str/includes? (pr-str d) " 7")) (pr-str config))))
     (is (= "***" (:password (:received (thrown-data #(util/config->upstream {:host "h" :password 7}))))))
-    (is (= "redis://u:***@h" (:url (:received (thrown-data #(util/config->upstream {:url "redis://u:SYNTHETIC SECRET@h"})))))))
+    (is (= "redis://u:***@h" (:url (:received (thrown-data #(util/config->upstream {:url "redis://u:SYNTHETIC SECRET@h"}))))))
+    (is (= "redis://***" (:url (:received (thrown-data #(util/config->upstream {:url "redis://u:SYNTHETIC?SECRET@h"}))))))
+    (is (= "redis://***" (:url (:received (thrown-data #(util/config->upstream {:url "redis://u:SYNTHETIC#SECRET@h"})))))))
   (testing "the pool split"
     (is (= [{"RESP" 2 "maintNotifications" "disabled" "socket" {"host" "h" "reconnectStrategy" false}}
             {"minimum" 2 "maximum" 4}]
@@ -233,6 +251,15 @@
     (is (= "redis://:***@h" (util/redacted "redis://:SECRET@h")))
     (is (= "redis://user@h" (util/redacted "redis://user@h")) "a username alone is no secret")
     (is (= "redis://h:6379/0" (util/redacted "redis://h:6379/0")) "no credentials, nothing masked"))
+  (testing "an @ past the authority (after a /, ? or #) leaves the credentials' end unknown: everything after the scheme is masked"
+    (is (= {:url "redis://***"} (util/redacted {:url "redis://u:SYNTHETIC?SECRET@h"})))
+    (is (= "redis://***" (util/redacted "redis://u:SYNTHETIC#SECRET@h")))
+    (is (= "redis://***" (util/redacted "redis://u:SYNTHETIC/SECRET@h")))
+    (is (= "rediss://***" (util/redacted "rediss://u:SYN@THETIC?SECRET@h")) "an @ in the authority too does not settle it")
+    (is (= "redis://***" (util/redacted "redis://h/0?x=a@b")) "a valid URL with @ in its query is masked the same way")
+    (is (= "***" (util/redacted "u:SYNTHETIC?SECRET@h")) "no scheme, nothing kept")
+    (is (= "redis://u:***@h/0?x=1" (util/redacted "redis://u:SECRET@h/0?x=1")) "an @ in the authority alone is read as before")
+    (is (= "redis://h:notaport" (util/redacted "redis://h:notaport")) "no @, no credentials"))
   (testing "a :url or :tls-options of the wrong type is masked whole"
     (is (= {:url "***"} (util/redacted {:url {:password "SECRET"}})))
     (is (= {:host "h" :tls-options "***"} (util/redacted {:host "h" :tls-options "PRIVATE_KEY"}))))
