@@ -1,0 +1,213 @@
+#+TITLE: The Redis and node-redis surface redis-cljs wraps
+#+OPTIONS: toc:3
+
+* What this inventory is
+
+The EXTERNAL surface the library depends on: the RESP2 reply types, every Redis
+command the library's tests, examples and documentation use, with its arguments,
+reply and edge cases, and the part of node-redis 6.3.0 the binding namespace calls
+(client options, methods, events, errors, the pool). Each fact names its source: a
+public Redis documentation page, or a file of the installed =redis= 6.3.0 package
+(paths under =node_modules/@redis/client/dist/lib/=, read as installed). A fact that
+comes from documentation alone and was not exercised against a server is marked
+"unverified against the live service": the library's suite runs against a scripted
+fake, not a Redis.
+
+Sources used throughout:
+- Redis command reference: https://redis.io/docs/latest/commands/ (one page per
+  command, =https://redis.io/docs/latest/commands/<name>/=)
+- RESP protocol: https://redis.io/docs/latest/develop/reference/protocol-spec/
+- Pub/sub: https://redis.io/docs/latest/develop/interact/pubsub/
+- node-redis: https://github.com/redis/node-redis and the installed package
+
+* The protocol (RESP2)
+
+Source: the protocol specification page. The library pins =RESP 2=; node-redis 6.3.0
+defaults to RESP3 (=RESP/types.js=: =exports.DEFAULT_RESP = 3=, observed in the
+installed file).
+
+| type          | first byte | wire                    | decoded by node-redis | the library gives |
+|---------------+------------+-------------------------+-----------------------+-------------------|
+| simple string | =+=        | =+OK\r\n=               | string                | string            |
+| error         | =-=        | =-ERR message\r\n=      | =ErrorReply= (SimpleError) rejecting the command | =:redis-cljs/api-error=, =:message= verbatim, =:code= the first word |
+| integer       | =:=        | =:42\r\n=               | number                | number            |
+| bulk string   | =$=        | =$5\r\nhello\r\n=       | string, or Buffer with the type mapping | string, or Buffer with ={:buffers? true}= |
+| null bulk     | =$-1=      | =$-1\r\n=               | null                  | nil               |
+| array         | =*=        | =*2\r\n...=             | array                 | vector            |
+| null array    | =*-1=      | =*-1\r\n=               | null                  | nil               |
+
+Requests are arrays of bulk strings; the inline form (a line of words) is also
+accepted by a server (specification page; the fake server accepts both).
+
+* Commands in scope
+
+For each command: the arguments as the library sends them, the reply, the edge cases
+that matter to a caller, and the source. "Unverified" marks a behavior taken from the
+documentation page and not exercised against a server. "Exercised" in the last column
+means the command round-trips in the suite (=core_test=, =pool_test=, =pubsub_test=
+or the examples) against the fake with the reply shape the page describes; "not
+exercised" means the row rests on the documentation page alone.
+
+** Strings
+
+| command  | arguments                                   | reply                                            | edge cases                                                                 | source | suite |
+|----------+---------------------------------------------+--------------------------------------------------+----------------------------------------------------------------------------+--------+-------|
+| =GET=    | key                                         | bulk string, nil when the key is absent          | =WRONGTYPE= when the key holds another type (unverified)                   | commands/get/ | exercised |
+| =SET=    | key value [NX|XX] [GET] [EX s|PX ms|EXAT|PXAT|KEEPTTL] | =+OK=; nil when NX/XX did not set; with GET the old value or nil | a value is stored as the bytes given; a number argument is sent as its text | commands/set/ | exercised (with EX) |
+| =SETNX=  | key value                                   | integer 1 set, 0 not set                         | deprecated in favor of =SET NX= (unverified)                               | commands/setnx/ | exercised |
+| =INCR=, =DECR=, =INCRBY=, =DECRBY= | key [increment]   | integer, the new value                           | =ERR value is not an integer or out of range= when the value is not a 64-bit integer string (unverified); a missing key counts as 0 | commands/incr/ | exercised |
+| =APPEND= | key value                                   | integer, the length after the append             |                                                                            | commands/append/ | exercised |
+| =STRLEN= | key                                         | integer, 0 for an absent key                     |                                                                            | commands/strlen/ | exercised |
+| =MGET=   | key ...                                     | array of bulk strings, nil per absent key        |                                                                            | commands/mget/ | exercised |
+| =MSET=   | key value ...                               | =+OK=                                            |                                                                            | commands/mset/ | exercised |
+
+** Hashes
+
+| command   | arguments                     | reply                                                    | edge cases                                          | source | suite |
+|-----------+-------------------------------+----------------------------------------------------------+-----------------------------------------------------+--------+-------|
+| =HSET=    | key field value ...           | integer, the number of NEW fields                        | several pairs since 4.0 (unverified)                | commands/hset/ | exercised |
+| =HGET=    | key field                     | bulk string, nil when absent                             | =WRONGTYPE= on a non-hash key                       | commands/hget/ | exercised, with the WRONGTYPE reply |
+| =HMGET=   | key field ...                 | array, nil per absent field                              |                                                     | commands/hmget/ | exercised |
+| =HGETALL= | key                           | RESP2: flat array of field, value, ...; empty for an absent key | RESP3 answers a map; the library stays on RESP2 | commands/hgetall/ | exercised |
+| =HDEL=    | key field ...                 | integer, fields removed                                  |                                                     | commands/hdel/ | exercised |
+| =HEXISTS= | key field                     | integer 1 or 0                                           |                                                     | commands/hexists/ | exercised |
+| =HINCRBY= | key field increment           | integer, the new value                                   |                                                     | commands/hincrby/ | exercised |
+
+** Lists (the queue primitives)
+
+| command   | arguments                   | reply                                                   | edge cases                                                             | source | suite |
+|-----------+-----------------------------+---------------------------------------------------------+------------------------------------------------------------------------+--------+-------|
+| =RPUSH=, =LPUSH= | key element ...      | integer, the length after the push                      | the key is created when absent; RPUSH appends at the tail, LPUSH at the head | commands/rpush/ | exercised |
+| =LPOP=, =RPOP= | key [count]            | bulk string, nil when the list is empty or absent; with count an array | an empty list is deleted (unverified); LPOP takes the head, RPOP the tail | commands/lpop/ | exercised |
+| =LLEN=    | key                         | integer, 0 for an absent key                            |                                                                        | commands/llen/ | exercised |
+| =LRANGE=  | key start stop              | array of bulk strings; =0 -1= for all                   |                                                                        | commands/lrange/ | exercised |
+| =BRPOP=, =BLPOP= | key ... timeout      | array =[key element]= from the first non-empty key in the order given; nil (null array) when the timeout elapsed | timeout in seconds, 0 blocks forever, fractional since 6.0 (unverified); the connection is blocked until the reply; BRPOP takes the tail, BLPOP the head (RPUSH + BLPOP is a FIFO queue); =WRONGTYPE= when a key holds another type | commands/brpop/ | exercised (both) |
+
+The library's =brpop!= / =blpop!= send =BRPOP key... timeout= again after each
+=[key element]= reply, stop at the nil reply, and stop sending when =stop-feed!= or
+=end!= asks.
+
+** Transactions
+
+| command    | arguments | reply                                                                      | edge cases                                                                                     | source | suite |
+|------------+-----------+----------------------------------------------------------------------------+------------------------------------------------------------------------------------------------+--------+-------|
+| =MULTI=    |           | =+OK=                                                                      | the commands that follow answer =+QUEUED= until EXEC or DISCARD                                | commands/multi/ | exercised |
+| =EXEC=     |           | array of the replies of the block, in order; a failed command's reply is an error reply inside the array; nil (null array) when a WATCHed key changed | the block runs as a whole; a command refused at queue time (unknown command) aborts the whole EXEC with =EXECABORT= (unverified) | commands/exec/ | exercised, with a mixed reply |
+| =DISCARD=  |           | =+OK=                                                                      | not exercised                                                                                  | commands/discard/ | not exercised |
+| =WATCH=    | key ...   | =+OK=                                                                      | EXEC answers nil when a watched key changed; a transaction belongs on one connection (=with-client!=) (unverified) | commands/watch/ | not exercised |
+| =UNWATCH=  |           | =+OK=                                                                      | not exercised                                                                                  | commands/unwatch/ | not exercised |
+
+The library resolves a mixed EXEC reply with the error elements as maps and the
+failures as =:redis-cljs/warnings= metadata on the vector.
+
+** Keys and expiry
+
+| command   | arguments                       | reply                                                                      | edge cases                                                | source | suite |
+|-----------+---------------------------------+----------------------------------------------------------------------------+-----------------------------------------------------------+--------+-------|
+| =EXISTS=  | key ...                         | integer, how many exist                                                    |                                                           | commands/exists/ | exercised |
+| =DEL=     | key ...                         | integer, how many were removed                                             |                                                           | commands/del/ | exercised |
+| =EXPIRE=, =PEXPIRE= | key seconds/ms [NX|XX|GT|LT] | integer 1 set, 0 not set (absent key, or the condition not met)  |                                                           | commands/expire/ | exercised (both) |
+| =TTL=, =PTTL= | key                         | integer: the time left; =-1= no expiry; =-2= the key does not exist        | the library shows =-2= and nil from =GET= once a key expired, as the fake scripts it | commands/ttl/ | exercised (both) |
+| =KEYS=    | pattern                         | array of key names                                                         | blocks the server on large keyspaces; prefer =SCAN= (documentation) | commands/keys/ | exercised |
+| =SCAN=    | cursor [MATCH pattern] [COUNT n] [TYPE t] | array =[cursor-string, [key ...]]=; cursor ="0"= when complete    | cursors are strings, not numbers                          | commands/scan/ | exercised |
+
+** Connection
+
+| command            | arguments               | reply                                            | edge cases                                                                 | source | suite |
+|--------------------+-------------------------+--------------------------------------------------+----------------------------------------------------------------------------+--------+-------|
+| =PING=             | [message]               | =+PONG=, or the message as a bulk string         | in subscribed mode under RESP2 the reply is an array (unverified)          | commands/ping/ | exercised |
+| =ECHO=             | message                 | the message as a bulk string                     |                                                                            | commands/echo/ | not exercised (built into the fake) |
+| =AUTH=             | [username] password     | =+OK=; =-WRONGPASS invalid username-password pair or user is disabled.= on failure; =-ERR AUTH <password> called without any password configured= when the server has none (unverified) | node-redis sends it first when credentials are configured | commands/auth/ | exercised, with the WRONGPASS reply |
+| =SELECT=           | index                   | =+OK=; =-ERR DB index is out of range= (unverified) | node-redis sends it for a non-zero database                              | commands/select/ | exercised |
+| =QUIT=             |                         | =+OK=, then the server closes the connection     | node-redis 6 =close()= does not send it: it ends the socket (observed)     | commands/quit/ | not exercised |
+| =CLIENT ID=        |                         | integer                                          |                                                                            | commands/client-id/ | exercised |
+| =CLIENT SETNAME=   | name                    | =+OK=                                            | node-redis sends it for =:name= (observed)                                 | commands/client-setname/ | exercised |
+| =CLIENT SETINFO=   | LIB-NAME|LIB-VER value  | =+OK=; an error on a Redis older than 7.2        | node-redis sends the pair on every connection and ignores the error (observed in =client/index.js=) | commands/client-setinfo/ | exercised (sent by node-redis) |
+
+** Pub/sub
+
+| command        | arguments      | reply                                                                       | edge cases                                                                       | source | suite |
+|----------------+----------------+-----------------------------------------------------------------------------+----------------------------------------------------------------------------------+--------+-------|
+| =SUBSCRIBE=    | channel ...    | one array =["subscribe" channel count]= per channel                         | the connection enters subscribed mode; under RESP2 only (P/S)SUBSCRIBE, (P/S)UNSUBSCRIBE, PING, QUIT, RESET are allowed afterwards (unverified) | commands/subscribe/ | exercised, with the NOPERM reply |
+| =UNSUBSCRIBE=  | [channel ...]  | one array =["unsubscribe" channel count]= per channel; =["unsubscribe" nil 0]= when nothing was subscribed | without arguments, every channel                 | commands/unsubscribe/ | exercised |
+| =PUBLISH=      | channel message| integer, the number of clients that received it                              | 0 when nobody listens; nothing is queued for absent subscribers                | commands/publish/ | exercised |
+| a message      | pushed         | array =["message" channel payload]=                                         | node-redis hands only these to a listener; the confirmations stay internal (observed) | pub/sub page | exercised |
+
+* node-redis 6.3.0
+
+Source: the installed package. Paths are under =node_modules/@redis/client/dist/lib/=.
+
+** Client options (=client/index.d.ts=, =RedisClientOptions=; =client/socket.d.ts=)
+
+| option                     | the library's key           | note                                                                      |
+|----------------------------+-----------------------------+---------------------------------------------------------------------------|
+| =url=                      | =:url=                      | =redis[s]://[[username][:password]@][host][:port][/db-number]=; =parseURL= sets =socket.tls= for =rediss:= (observed) |
+| =socket.host=, =socket.port= | =:host=, =:port=          | =createConnection= defaults: localhost, 6379                               |
+| =socket.tls= and the tls options | =:tls=, =:tls-options= | =tls: true= switches to =tls.connect= with the other socket options spread in (=socket.js=) |
+| =socket.connectTimeout=    | =:connect-timeout-ms=       | default 5000 (=socket.js=); =ConnectionTimeoutError= "Connection timeout" |
+| =socket.reconnectStrategy= | =:reconnect=                | =false=, a number, or =(retries, cause) => number | false | Error=; default: =defaultReconnectStrategy=, retries without limit (observed) |
+| =socket.socketTimeout=     | =:socket-timeout-ms=        | =SocketTimeoutError=                                                       |
+| =username=, =password=     | =:username=, =:password=    | turned into an async credentials provider; =AUTH= is sent under RESP2, =HELLO 3 AUTH= under RESP3 (=#getHandshakeCommands=) |
+| =database=                 | =:database=                 | =SELECT= sent when non-zero                                                |
+| =name=                     | =:name=                     | =CLIENT SETNAME= under RESP2                                               |
+| =RESP=                     | fixed to 2                  | =DEFAULT_RESP = 3=                                                         |
+| =pingInterval=             | =:ping-interval-ms=         |                                                                           |
+| =disableOfflineQueue=      | =:disable-offline-queue=    | with the queue on, commands sent while disconnected wait for the connection |
+| =maintNotifications=       | fixed to ="disabled"=       | ="disabled" | "enabled" | "auto"=; not disabled: =CLIENT MAINT_NOTIFICATIONS ON= in the handshake after a DNS lookup of a host name (=enterprise-maintenance-manager.js=), and upstream throws "Graceful Maintenance is only supported with RESP3" under RESP2, which the library pins: not exposed |
+| =disableClientInfo=        | not exposed                 | would suppress =CLIENT SETINFO=                                            |
+| =commandOptions=, =typeMapping= | per command through =:buffers?= | =typeMapping[36] = Buffer= makes bulk strings Buffers (=RESP_TYPES.BLOB_STRING=, 36) |
+| =clientSideCache=, =credentialsProvider=, =readonly=, =legacyMode=, =scripts=, =functions=, =modules= | not exposed | out of scope for a thin client |
+
+** Client methods used (=client/index.d.ts=)
+
+| method                                   | the library's function                | note                                                                 |
+|------------------------------------------+---------------------------------------+----------------------------------------------------------------------|
+| =createClient(options)=                  | =connect!= (construction)             | synchronous; throws for a URL that does not parse                    |
+| =client.connect()=                       | =connect!=                            | resolves after the handshake                                         |
+| =client.sendCommand(args, options)=      | =command!=                            | =args= strings or Buffers; the raw reply                             |
+| =client.subscribe(channels, listener, bufferMode)= | =subscribe!=                | listener =(message, channel)=; SUBSCRIBE sent for the first listener of a channel (=client/pub-sub.js=) |
+| =client.unsubscribe(channels, listener, bufferMode)= | =unsubscribe!=            | UNSUBSCRIBE sent when the last listener is removed                   |
+| =client.close()=                         | =end!=                                | waits for the pending commands (observed with a pending BRPOP)       |
+| =client.destroy()=                       | =end!= with =:force?=                 | rejects pending commands with =DisconnectsClientError=               |
+| =client.isOpen=, =isReady=, =isPubSubActive= | =status=                          |                                                                      |
+| =client.options=                         | handle printing                       | =socket.host=, =socket.port=, =database=, =name= read; never the password |
+| events =error=, =end=, =terminated=, =ready=, =connect=, =reconnecting= | =last-error=, =on-end!= | =error= with no listener would throw (Node EventEmitter); =end= on every socket destruction, =terminated= when the reconnect strategy gives up (=socket.js=, observed) |
+
+** Errors (=errors.js=)
+
+| class                           | message                                              | the library's type      |
+|---------------------------------+------------------------------------------------------+-------------------------|
+| =ErrorReply= / =SimpleError=    | the server's text                                    | =:redis-cljs/api-error= |
+| =ClientClosedError=             | "The client is closed"                               | =:redis-cljs/network-error= |
+| =ClientOfflineError=            | "The client is offline"                              | network-error           |
+| =DisconnectsClientError=        | "Disconnects client"                                 | network-error           |
+| =SocketClosedUnexpectedlyError= | "Socket closed unexpectedly"                         | network-error           |
+| =ConnectionTimeoutError=        | "Connection timeout"                                 | network-error           |
+| =SocketTimeoutError=            | "Socket timeout timeout. Expecting data, but didn't receive any in Nms." | network-error |
+| =ReconnectStrategyError=        | the strategy's Error message; =.socketError= the cause | network-error         |
+| =TimeoutError= (pool)           | "Timeout waiting for a client after Nms"             | network-error           |
+| a socket error                  | "connect ECONNREFUSED host:port", =.code= "ECONNREFUSED" | network-error with =:code= |
+
+** The client pool (=client/pool.d.ts=, =client/pool.js=)
+
+| item                                   | the library's                     | note                                                                 |
+|----------------------------------------+-----------------------------------+----------------------------------------------------------------------|
+| =createClientPool(clientOptions, poolOptions)= | =pool!=                   | synchronous                                                          |
+| =minimum= (1), =maximum= (100), =acquireTimeout= (3000), =cleanupDelay= (3000) | =:minimum :maximum :acquire-timeout-ms :cleanup-delay-ms= | defaults observed in =pool.js= |
+| =pool.connect()=                       | =connect!=                        | opens =minimum= clients                                              |
+| =pool.sendCommand(args, options)=      | =command!=                        | =execute= on a free client                                           |
+| =pool.execute(fn)=                     | =with-client!=                    | the client is returned in a =finally=; only a native Promise counts as a pending task (observed) |
+| =pool.close()=                         | =end!=                            |                                                                      |
+| =totalClients=, =idleClients=, =tasksQueueLength=, =isOpen=, =isClosing= | =status=     |                                                                      |
+| event =error=                          | =last-error=                      | re-emitted from every pooled client                                  |
+
+* Open questions
+
+- The exact server reply to a non-pub/sub command on a subscribed RESP2 connection
+  (an =-ERR Can't execute ...= is documented) was not observed: unverified against
+  the live service.
+- Whether =close()= on a connection with a =BRPOP= of timeout 0 can be interrupted
+  other than by =destroy()= (=CLIENT UNBLOCK= from another connection is documented):
+  unverified against the live service.
+- RESP2 integer replies above 2^53: the loss of precision is a property of
+  JavaScript numbers; not exercised against a server.
