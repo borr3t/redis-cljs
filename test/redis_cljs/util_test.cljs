@@ -122,6 +122,18 @@
     (is (= {:tls? false :username "" :password "p" :host "h"} (util/parse-url "redis://:p@h")))
     (is (= {:tls? false :host "[::1]" :port 6379} (util/parse-url "redis://[::1]:6379")))
     (is (= {:tls? false :host "h" :port 0} (util/parse-url "redis://h:0")))
+    (testing "an empty port or path leaves the part unspecified, as upstream does"
+      (is (= {:tls? false :host "h"} (util/parse-url "redis://h/")))
+      (is (= {:tls? false :host "h"} (util/parse-url "redis://h:")))
+      (is (= {:tls? false :host "h"} (util/parse-url "redis://h:/")))
+      (is (= {:tls? false :host "[::1]"} (util/parse-url "redis://[::1]:/"))))
+    (testing "the credentials are percent-decoded, as upstream reads them"
+      (is (= {:tls? false :username "u@name" :password "p@ss:word" :host "h" :database 2}
+             (util/parse-url "redis://u%40name:p%40ss%3Aword@h/2")))
+      (is (= {:tls? false :username "u@name" :password "SECRET" :host "h"} (util/parse-url "redis://u@name:SECRET@h")))
+      (is (nil? (util/parse-url "redis://u%zz:p@h")) "a malformed escape, which upstream refuses"))
+    (testing "a database too long for a number parses to Infinity, for check-config! to refuse"
+      (is (infinite? (:database (util/parse-url (str "redis://h/" (apply str (repeat 400 "9"))))))))
     (doseq [bad ["redis:///0" "redis://" "redis://h:notaport" "redis://h/-1" "redis://h/1.5" "http://h" "redis://h x" nil 7]]
       (is (nil? (util/parse-url bad)) (pr-str bad))))
   (testing "the effective configuration is refused like the explicit keys"
@@ -132,13 +144,20 @@
                                [{:url "redis://h/1.5"} :url]
                                [{:url "redis://h:notaport"} :url]
                                [{:url "redis://h" :tls true} :tls]
-                               [{:url "rediss://h" :tls false} :tls]]]
+                               [{:url "rediss://h" :tls false} :tls]
+                               [{:url (str "redis://h/" (apply str (repeat 400 "9")))} :database]
+                               [{:host "h" :database js/Infinity} :database]
+                               [{:url "redis://u%zz:p@h"} :url]]]
       (let [d (thrown-data #(util/check-config! (util/normalize-config config)))]
         (is (= :redis-cljs/config-error (:type d)) (pr-str config))
         (is (= argument (:argument d)) (pr-str config)))))
   (testing "a consistent :tls passes"
     (is (map? (util/check-config! (util/normalize-config {:url "rediss://h" :tls true}))))
-    (is (map? (util/check-config! (util/normalize-config {:url "redis://h:6380/3"}))))))
+    (is (map? (util/check-config! (util/normalize-config {:url "redis://h:6380/3"})))))
+  (testing "an empty port or path passes, the part unspecified"
+    (is (map? (util/check-config! (util/normalize-config {:url "redis://h/"}))))
+    (is (map? (util/check-config! (util/normalize-config {:url "redis://h:"}))))
+    (is (map? (util/check-pool-config! (util/normalize-config {:url "redis://h:/"}))))))
 
 (deftest check-pool-config-adds-the-pool-keys
   (let [cfg (util/normalize-config {:url "redis://h" :minimum 2 :maximum 4 :acquire-timeout-ms 10})]
@@ -185,6 +204,19 @@
         (is (= 'redis-cljs.util/config->upstream (:function d)) (pr-str config))))
     (is (not (str/includes? (pr-str (thrown-data #(util/config->upstream {:host "h" :tls-options {:key "SYNTHETIC_SECRET" :verify 1}})))
                             "SYNTHETIC_SECRET"))))
+  (testing "the check runs on the configuration itself: a secret of the wrong shape and a pool key out of range are refused, the error redacted"
+    (doseq [config [{:host "h" :password 7}
+                    {:url "redis://u:SYNTHETIC SECRET@h"}
+                    {:host "h" :minimum 0}
+                    {:host "h" :minimum 3 :maximum 1}
+                    {:host "h" :acquire-timeout-ms -1}]]
+      (let [d (thrown-data #(util/config->upstream config))]
+        (is (= :redis-cljs/argument-error (:type d)) (pr-str config))
+        (is (= 'redis-cljs.util/config->upstream (:function d)) (pr-str config))
+        (is (not (str/includes? (pr-str d) "SYNTHETIC")) (pr-str config))
+        (is (not (str/includes? (pr-str d) " 7")) (pr-str config))))
+    (is (= "***" (:password (:received (thrown-data #(util/config->upstream {:host "h" :password 7}))))))
+    (is (= "redis://u:***@h" (:url (:received (thrown-data #(util/config->upstream {:url "redis://u:SYNTHETIC SECRET@h"})))))))
   (testing "the pool split"
     (is (= [{"RESP" 2 "maintNotifications" "disabled" "socket" {"host" "h" "reconnectStrategy" false}}
             {"minimum" 2 "maximum" 4}]
@@ -195,6 +227,12 @@
   (testing "a password holding @ is masked whole, up to the last @"
     (is (= {:url "redis://u:***@h:1"} (util/redacted {:url "redis://u:one@SECRET@h:1"})))
     (is (= "redis://u:***@h" (util/redacted "redis://u:one@two@SECRET@h"))))
+  (testing "a username holding @ does not move the mask: the first colon of the credentials starts it"
+    (is (= {:url "redis://u@name:***@h"} (util/redacted {:url "redis://u@name:SECRET@h"})))
+    (is (= "redis://u@name:***@h/2" (util/redacted "redis://u@name:SE:CR@ET@h/2")))
+    (is (= "redis://:***@h" (util/redacted "redis://:SECRET@h")))
+    (is (= "redis://user@h" (util/redacted "redis://user@h")) "a username alone is no secret")
+    (is (= "redis://h:6379/0" (util/redacted "redis://h:6379/0")) "no credentials, nothing masked"))
   (testing "a :url or :tls-options of the wrong type is masked whole"
     (is (= {:url "***"} (util/redacted {:url {:password "SECRET"}})))
     (is (= {:host "h" :tls-options "***"} (util/redacted {:host "h" :tls-options "PRIVATE_KEY"}))))

@@ -9,9 +9,11 @@
    Pure: no I/O and no JavaScript interop. Turning the translated maps into
    JS objects, reading properties off JS errors and converting replies is
    interop and lives in the single binding namespace (redis-cljs.binding);
-   this namespace deals in strings, keywords, maps and vectors only. The
-   one exception to the no-promises rule is run-op, the promise adapter: it
-   is plumbing, not I/O.
+   this namespace deals in strings, keywords, maps and vectors only. Two
+   exceptions: run-op, the promise adapter, is plumbing, not I/O; and
+   parse-url decodes the percent-escapes of a URL's credentials with
+   decodeURIComponent, a pure function of a string, because node-redis
+   does.
 
    Values are never reinterpreted here: a key, a field or a value given to
    a command travels as the string or Buffer it is; a reply comes back as
@@ -242,19 +244,29 @@
 ;; Redaction
 ;; ---------------------------------------------------------------------------
 
-(def ^:private url-password-pattern
-  "The password part of a URL: from the colon after the username to the
-   LAST @ before the path, so a password holding @ itself is masked
-   whole (node-redis reads the authority the same way: the last @ ends
-   the credentials)."
-  #"://([^:/@]*):[^/]*@")
+(def ^:private url-credentials-pattern
+  "The credentials of a URL: everything between :// and the LAST @ before
+   the path, so a username or a password holding @ itself is read whole
+   (node-redis reads the authority the same way: the last @ ends the
+   credentials)."
+  #"://([^/?#]*)@")
+
+(defn- masked-credentials
+  "The credentials of a URL with their password part masked: what follows
+   the FIRST colon, the separator of username and password, replaced by
+   ***; credentials without a colon (a username alone) kept."
+  [credentials]
+  (if-let [i (str/index-of credentials ":")]
+    (str (subs credentials 0 i) ":***")
+    credentials))
 
 (defn- redact-url
   "A URL string with its password masked; anything that is not a string
    masked whole (an invalid :url value may still hold a secret)."
   [url]
   (if (string? url)
-    (str/replace url url-password-pattern "://$1:***@")
+    (str/replace url url-credentials-pattern
+                 (fn [[_ credentials]] (str "://" (masked-credentials credentials) "@")))
     "***"))
 
 (defn- redact-tls-options
@@ -386,13 +398,25 @@
    host and port, database."
   #"^(rediss?)://(?:([^/?#]*)@)?([^/?#@]*)(?:/([^?#]*))?(?:\?.*)?$")
 
+(defn- decode-component
+  "A URL component with its percent-escapes decoded, as node-redis reads
+   the username and the password (decodeURIComponent); nil for a
+   malformed escape, which node-redis refuses."
+  [s]
+  (try (js/decodeURIComponent s) (catch :default _ nil)))
+
 (defn parse-url
   "The parts of a :url as node-redis reads them: {:tls? b :username s
-   :password s :host s :port n :database n}, the absent parts absent;
-   nil when the string holds whitespace or does not match url-pattern,
-   when the port or the database is not a string of digits, or when the
-   host is empty (a bracketed IPv6 host is kept with its brackets). Pure; the parsed parts
-   are checked by check-config! like the explicit keys."
+   :password s :host s :port n :database n}, the absent parts absent: an
+   empty port (redis://h:) and an empty path (redis://h/) leave :port and
+   :database absent, as upstream leaves them unspecified; the username
+   and the password are percent-decoded (u%40name is u@name). nil when
+   the string holds whitespace or does not match url-pattern, when a
+   non-empty port or database is not a string of digits, when a
+   credential holds a malformed percent-escape, or when the host is
+   empty (a bracketed IPv6 host is kept with its brackets). Pure; the
+   parsed parts are checked by check-config! like the explicit keys (a
+   database too long for a number is refused there)."
   [url]
   (when (and (string? url) (not (re-find #"\s" url)))
     (when-let [[_ scheme credentials host-port database] (re-matches url-pattern url)]
@@ -403,14 +427,18 @@
             [username password] (when credentials
                                    (let [i (str/index-of credentials ":")]
                                      (if (nil? i) [credentials nil] [(subs credentials 0 i) (subs credentials (inc i))])))
-            port-n (when (some? port) (parse-integer port))
-            database-n (when (some? database) (parse-integer database))]
+            username-d (when (some? username) (decode-component username))
+            password-d (when (some? password) (decode-component password))
+            port-n (when (seq port) (parse-integer port))
+            database-n (when (seq database) (parse-integer database))]
         (when (and (seq host)
-                   (or (nil? port) (some? port-n))
-                   (or (nil? database) (some? database-n)))
+                   (or (empty? port) (some? port-n))
+                   (or (empty? database) (some? database-n))
+                   (or (nil? username) (some? username-d))
+                   (or (nil? password) (some? password-d)))
           (cond-> {:tls? (= "rediss" scheme) :host host}
-            (some? username) (assoc :username username)
-            (some? password) (assoc :password password)
+            (some? username-d) (assoc :username username-d)
+            (some? password-d) (assoc :password password-d)
             (some? port-n) (assoc :port port-n)
             (some? database-n) (assoc :database database-n)))))))
 
@@ -430,6 +458,8 @@
                              (redact-url url))))
       (when (and (contains? parsed :port) (not (port? (:port parsed))))
         (throw (config-error function :port "an integer between 1 and 65535 (in :url)" (:port parsed))))
+      (when (and (contains? parsed :database) (not (non-negative-integer? (:database parsed))))
+        (throw (config-error function :database "a non-negative integer (in :url)" (:database parsed))))
       (when (and (contains? config :tls) (not= (:tls config) (:tls? parsed)))
         (throw (config-error function :tls "consistent with the scheme of :url (rediss:// for true, redis:// for false)" (:tls config)))))))
 
@@ -509,18 +539,16 @@
    \"socket\", :tls-options spread into it through tls-option-keys, every
    other value verbatim, plus fixed-upstream-options (RESP 2, maintenance
    notifications off). Pool-only keys are left out. A map that
-   check-pool-config! would refuse (an unknown key, a wrong value, a bad
-   :tls-options) is an argument-error: the documented path validates
-   first, this guards a direct call."
+   check-pool-config! refuses (an unknown key, a wrong value, a bad
+   :tls-options, a pool key out of range) is an argument-error: the
+   documented path validates first, this guards a direct call. The check
+   runs on the configuration itself; only the error's :received is
+   redacted."
   [config]
-  (check! 'redis-cljs.util/config->upstream :config
-          (fn [c]
-            (and (map? c)
-                 (try (check-keys! 'redis-cljs.util/config->upstream :config pool-config-keys c)
-                      (check-values! 'redis-cljs.util/config->upstream c)
-                      true
-                      (catch :default _ false))))
-          "a configuration map that check-pool-config! accepts" (redacted config))
+  (when-not (and (map? config)
+                 (try (check-pool-config! config) true (catch :default _ false)))
+    (throw (argument-error 'redis-cljs.util/config->upstream :config
+                           "a configuration map that check-pool-config! accepts" (redacted config))))
   (reduce (fn [m [k v]]
             (if-let [path (get client-config-keys k)]
               (cond

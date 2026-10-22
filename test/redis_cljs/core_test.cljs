@@ -663,9 +663,32 @@
           (fn [server]
             (p/let [client (core/connect! (fake/config server))
                     _ (core/end! client)
-                    m (take! (core/brpop! client "q"))]
+                    ch (core/brpop! client "q")
+                    m (take! ch)
+                    closed (take! ch)
+                    stopped (core/stop-feed! client ch)]
               (is (= :redis-cljs/network-error (:type (ex-data (:error m)))))
-              (is (= "The client is closed" (:message (ex-data (:error m))))))))))))
+              (is (= "The client is closed" (:message (ex-data (:error m)))))
+              (is (nil? closed) "the channel closes after the error")
+              (is (= #{} (core/feeds client)))
+              (is (nil? stopped) "stop-feed! takes the closed channel"))))))))
+
+(deftest trailing-slash-and-empty-port-urls-connect
+  (async done
+    (run done
+      (fn []
+        (with-server {"PING" (fake/simple "PONG")}
+          (fn [server]
+            (p/let [slash (core/connect! {:url (fake/url server "/")})
+                    pong-1 (core/command! slash [:ping])
+                    _ (core/end! slash)
+                    ;; an empty port in the URL leaves the explicit :port in force
+                    empty-port (core/connect! {:url "redis://127.0.0.1:" :port (fake/port server)})
+                    pong-2 (core/command! empty-port [:ping])
+                    _ (core/end! empty-port)]
+              (is (= "PONG" pong-1))
+              (is (= "PONG" pong-2))
+              (is (= [["PING"] ["PING"]] (fake/commands server))))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Ending

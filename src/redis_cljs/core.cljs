@@ -310,9 +310,11 @@
   (get-in @(:state client) [:feeds ch]))
 
 (defn- finish-feed!
-  "Closes the channel of a feed and forgets it. What the channel holds
-   (its buffer, and a put still waiting for room) stays takeable until
-   exhausted, so nothing popped is lost."
+  "Closes the channel of a feed and forgets it (nothing to forget for a
+   channel never registered, the one pop of an ended client; closing a
+   closed channel is a no-op). What the channel holds (its buffer, and a
+   put still waiting for room) stays takeable until exhausted, so
+   nothing popped is lost."
   [client ch]
   (async/close! ch)
   (swap! (:state client) update :feeds dissoc ch))
@@ -360,13 +362,14 @@
                                                  (resolve nil)))
                                        (p/catch (fn [e]
                                                   (async/put! ch {:error e})
-                                                  (when (feed-of client ch) (finish-feed! client ch))
+                                                  (finish-feed! client ch)
                                                   (resolve nil))))))]
                   (swap! feed assoc :in-flight in-flight)
                   (p/then in-flight (fn [_] (swap! feed (fn [f] (if (identical? (:in-flight f) in-flight) (assoc f :in-flight nil) f))))))))]
       (if (:ended? @(:state client))
-        ;; on a client that already ended the one pop rejects at once and
-        ;; the error reaches the channel
+        ;; on a client that already ended the one pop rejects at once, the
+        ;; error reaches the channel and the channel is closed; the feed is
+        ;; never registered (no end is left to wait for)
         (step)
         (do (swap! (:state client) assoc-in [:feeds ch] feed)
             (when-not (:end-hook-for-feeds? @(:state client))

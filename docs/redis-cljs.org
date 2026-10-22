@@ -381,14 +381,14 @@ replies are what the server sent: strings, numbers, nil, vectors
 expected: (= 42 incr)
   actual: (not (= 42 43))
 ...
-Ran 89 tests containing 1124 assertions.
+Ran 92 tests containing 1182 assertions.
 38 failures, 0 errors.
 #+end_example
 
 And of the run after the revert (exit status 0):
 
 #+begin_example
-Ran 89 tests containing 1124 assertions.
+Ran 92 tests containing 1182 assertions.
 0 failures, 0 errors.
 #+end_example
 
@@ -721,9 +721,10 @@ runs.
 
 **** redis-cljs.util/check-config!
 =(check-config! config)= returns =config= when every key is a client key, every
-value has the right shape, a =:url= parses with a host, a port in range, an integer
-database and a scheme consistent with =:tls=, and =:url= or =:host= is present; throws
-a config-error (its =:received= redacted) otherwise.
+value has the right shape, a =:url= parses with a host, a port in range (when given),
+a non-negative integer database (when given; one too long for a number is refused)
+and a scheme consistent with =:tls=, and =:url= or =:host= is present; throws a
+config-error (its =:received= redacted) otherwise.
 
 **** redis-cljs.util/check-pool-config!
 =(check-pool-config! config)= returns =config= under the same rules with the pool
@@ -732,15 +733,18 @@ keys allowed and checked, =:minimum= not above =:maximum=.
 **** redis-cljs.util/config->upstream
 =(config->upstream config)= returns the nested map keyed by node-redis's option
 names, with =RESP 2= and =maintNotifications "disabled"= added. Throws an
-argument-error for a map =check-pool-config!= would refuse.
+argument-error for a map =check-pool-config!= refuses (the check runs on the map
+itself; only the error's =:received= is redacted).
 
 **** redis-cljs.util/pool-config->upstream
 =(pool-config->upstream config)= returns =[client-options pool-options]=.
 
 **** redis-cljs.util/redacted
 =(redacted config)= returns the configuration with =:password= replaced by ="***"=,
-the password part of a =:url= hidden (up to the last =@=, so a password holding =@=
-is masked whole), =:key= and =:passphrase= of =:tls-options= replaced by ="***"=, and
+the password part of a =:url= hidden (from the first colon of the credentials to the
+last =@= before the path, so a password holding =@= is masked whole and a username
+holding =@= leaves the mask in place), =:key= and =:passphrase= of =:tls-options=
+replaced by ="***"=, and
 a =:url= or =:tls-options= of another type masked whole; a bare URL string with its
 password hidden; anything else as it is.
 
@@ -751,8 +755,11 @@ quoted empty string is the empty string), nil for a blank or non-string input.
 
 **** redis-cljs.util/parse-url
 =(parse-url url)= returns the parts of a =:url= as node-redis reads them, ={:tls?
-:username :password :host :port :database}= (the absent parts absent), nil for a
-string that does not parse (whitespace, no host, a non-numeric port or database).
+:username :password :host :port :database}= (the absent parts absent: an empty port
+or an empty path leaves =:port= or =:database= absent, as upstream leaves them
+unspecified; the username and the password percent-decoded, =u%40name= read as
+=u@name=), nil for a string that does not parse (whitespace, no host, a non-numeric
+port or database, a malformed percent-escape in a credential).
 
 **** redis-cljs.util/parse-integer
 =(parse-integer s)= returns the non-negative integer a string of decimal digits
@@ -829,4 +836,6 @@ builds the options and argument objects, calls =createClient=, =connect=,
 functions return node-redis's own values (native promises, JavaScript objects and
 errors) and validate nothing but what the namespaces above cannot (=->bigint= refuses
 a string that is not an integer); they are not part of the documented surface and may
-change with node-redis. The namespaces above are the API.
+change with node-redis. The namespaces above are the API. =(keep-process-alive!)=
+starts an interval timer that keeps the Node process alive for a REPL (the dev
+namespace uses it) and returns the timer.

@@ -73,6 +73,11 @@
   (is (= :minimum (:argument (thrown-data #(pool/pool! {:host "h" :minimum "1"})))))
   (is (= :maximum (:argument (thrown-data #(pool/pool! {:host "h" :minimum 3 :maximum 1})))) ":minimum above :maximum")
   (is (= "***" (:received (thrown-data #(pool/pool! {:host "h" :password {:token "SYNTHETIC_SECRET"}})))))
+  (testing "an unknown key next to a URL whose username holds @: the password is redacted in :received"
+    (let [d (thrown-data #(pool/pool! {:url "redis://u@name:SYNTHETIC_SECRET@h" :bad 1}))]
+      (is (= #{:bad} (:unknown d)))
+      (is (= "redis://u@name:***@h" (:url (:received d))))
+      (is (not (str/includes? (pr-str d) "SYNTHETIC_SECRET")))))
   (testing "a URL the pool's clients could not use is refused at pool!, redacted"
     (doseq [[config argument] [[{:url "redis://u:SYNTHETIC_SECRET@h" :tls true} :tls]
                                [{:url "redis://u:SYNTHETIC_SECRET@h:notaport"} :url]
@@ -84,6 +89,28 @@
         (is (not (str/includes? (pr-str d) "SYNTHETIC_SECRET")) (pr-str config))
         (is (not (str/includes? m "SYNTHETIC_SECRET")) (pr-str config)))))
   (is (= :redis-cljs/config-error (:type (thrown-data #(pool/pool! 42))))))
+
+(deftest a-url-pool-prints-without-its-password
+  (async done
+    (run done
+      (fn []
+        (let [pool (pool/pool! {:url "redis://u@name:SYNTHETIC_SECRET@127.0.0.1:1"})
+              shown (pr-str pool)]
+          (is (str/includes? shown "redis://u@name:***@127.0.0.1:1"))
+          (is (not (str/includes? shown "SYNTHETIC_SECRET")))
+          (pool/end! pool))))))
+
+(deftest trailing-slash-and-empty-port-urls-are-accepted
+  (async done
+    (run done
+      (fn []
+        (p/let [slash (pool/pool! {:url "redis://127.0.0.1:1/"})
+                empty-port (pool/pool! {:url "redis://127.0.0.1:"})
+                both (pool/pool! {:url "redis://127.0.0.1:/"})]
+          (is (pool/pool? slash))
+          (is (pool/pool? empty-port))
+          (is (pool/pool? both))
+          (p/all [(pool/end! slash) (pool/end! empty-port) (pool/end! both)]))))))
 
 (deftest connect-command-and-with-client
   (async done
