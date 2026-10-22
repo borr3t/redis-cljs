@@ -603,7 +603,7 @@ src/redis_cljs/
   pubsub.cljs          subscribe!, unsubscribe!, subscribed, publish!
   helpers.cljs         pairs->map, map->pairs, pop-reply, scan-reply, ok?, big-int
   util.cljs            the translation tables, validation, the error taxonomy, redaction, the environment parsing, the promise adapter
-  binding.cljs         the one JavaScript namespace (internal): the redis module, clients, pools, events, errors, replies
+  binding.cljs         the JavaScript namespace (internal), all but the percent-decoding of URL credentials in util: the redis module, clients, pools, events, errors, replies
 dev/redis_cljs/
   examples.cljs        the examples of this page, offline
   dev.cljs             the Node runtime a REPL attaches to
